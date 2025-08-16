@@ -1,28 +1,30 @@
 #!/usr/bin/env bash
-# One-shot Cryptic Termux Orchestrator (original-style, no loop, no GoFile)
-# - Downloads Codex.0..Codex.8 from GitHub releases
-# - Attempts to install each APK, deletes on success
-# - Does NOT install Termux:Boot, does NOT loop, does NOT modify workspace JSON
-set -eo pipefail
+# executor_downloader.sh
+# Interactive menu wrapper around a one-shot APK downloader/installer
+# - Shows status per-APK (Pending, Downloading, Downloaded, Installed, Failed)
+# - Default list: Codex.0..Codex.8 (same as original)
+# - Logs to ~/.local/share/executor-downloader/run.log
+# - Designed to be readable and safe for Termux / standard Android shells
 
-# --------------- Configuration ---------------
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------------- Configuration ----------------
 BASE_URL="https://github.com/Fizlyss/cloud-phone/releases/download/er"
 APK_NAMES=( "Codex.0.apk" "Codex.1.apk" "Codex.2.apk" "Codex.3.apk" "Codex.4.apk" "Codex.5.apk" "Codex.6.apk" "Codex.7.apk" "Codex.8.apk" )
 
-# JSON settings intentionally disabled
-JSON_URL=""
-JSON_DEST=""
+APP_NAME="executor-downloader"
 
-# --------------- Paths & State ---------------
-LOG_DIR="$HOME/.local/share/cryptic_termux"
+# ---------------- Paths ----------------
+LOG_DIR="$HOME/.local/share/${APP_NAME}"
 APK_DIR="$HOME/apks"
-TMP_DIR="$HOME/.tmp_cryptic"
-STATE_DIR="$HOME/.cryptic_state"
+TMP_DIR="$HOME/.tmp_${APP_NAME}"
+STATE_DIR="$HOME/.${APP_NAME}_state"
 LOG_FILE="$LOG_DIR/run.log"
 
 mkdir -p "$LOG_DIR" "$APK_DIR" "$TMP_DIR" "$STATE_DIR"
 
-# --------------- Utilities ---------------
+# ---------------- Utilities ----------------
 timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
 log() {
@@ -48,98 +50,147 @@ http_fetch_to() {
   fi
 }
 
-ensure_root() {
-  # Optional: re-exec under tsu for root if not root (mirrors original behavior)
-  if [ "$(id -u)" -ne 0 ]; then
-    log "Re-executing under tsu for root privileges..."
-    exec tsu -c "bash -lc '$0 \"$@\"'"
-  fi
-}
-
-ensure_packages() {
-  # try to ensure basic tools are available (non-fatal)
-  log "Ensuring basic packages (curl, jq, coreutils)..."
-  apt update -y >>"$LOG_FILE" 2>&1 || true
-  apt install -y curl coreutils jq busybox procps unzip >>"$LOG_FILE" 2>&1 || true
-}
-
-ensure_storage() {
-  # Termux storage permission if possible (no writes to workspace)
-  if command -v termux-setup-storage >/dev/null 2>&1; then
-    log "Ensuring Termux storage access (if applicable)..."
-    termux-setup-storage >/dev/null 2>&1 || true
-  fi
-  mkdir -p "$APK_DIR" "$TMP_DIR" "$LOG_DIR"
-}
-
 pm_install_apk() {
   local apk="$1"
   log "Attempting install: $apk"
-  # try pm with typical flags
   if /system/bin/pm install -r -d --user 0 "$apk" >>"$LOG_FILE" 2>&1; then
     return 0
   fi
-  # fallback via cmd
   if command -v cmd >/dev/null 2>&1 && cmd package install -r "$apk" >>"$LOG_FILE" 2>&1; then
     return 0
   fi
-  # final fallback
   if /system/bin/pm install "$apk" >>"$LOG_FILE" 2>&1; then
     return 0
   fi
   return 1
 }
 
-# JSON sync intentionally omitted / disabled:
-task_json_sync() {
-  log "JSON sync disabled; skipping."
-  return 0
+# ---------------- Status bookkeeping ----------------
+declare -A STATUS
+declare -A DETAIL
+for name in "${APK_NAMES[@]}"; do
+  STATUS["$name"]="Pending"
+  DETAIL["$name"]=""
+done
+
+render_table() {
+  clear
+  printf "%-3s %-28s %-12s %s\n" "#" "Package" "Status" "Detail"
+  printf "%-3s %-28s %-12s %s\n" "--" "----------------------------" "------------" "---------------------------"
+  local i=1
+  for name in "${APK_NAMES[@]}"; do
+    printf "%-3d %-28s %-12s %s\n" "$i" "$name" "${STATUS[$name]}" "${DETAIL[$name]}"
+    i=$((i+1))
+  done
+  echo
 }
 
-# --------------- Tasks (one-shot) ---------------
-task_apk_download_and_install() {
-  log "APK task: starting download and install (one-shot)..."
-  mkdir -p "$APK_DIR"
+# ---------------- Tasks ----------------
+download_and_maybe_install() {
+  local install_after_download=${1:-1} # 1 = install after download, 0 = just download
   local ok_count=0 total=${#APK_NAMES[@]}
 
   for name in "${APK_NAMES[@]}"; do
     local url="$BASE_URL/$name"
     local dest="$APK_DIR/$name"
+
+    STATUS["$name"]="Downloading"
+    DETAIL["$name"]="$url"
+    render_table
     log "Fetching $name from $url"
+
     if http_fetch_to "$url" "$dest"; then
+      STATUS["$name"]="Downloaded"
+      DETAIL["$name"]="$dest"
+      render_table
       log "Downloaded $name -> $dest"
-      if pm_install_apk "$dest"; then
-        log "Installed $name successfully"
-        rm -f "$dest"
-        log "Deleted $name after install"
-        ok_count=$((ok_count+1))
-      else
-        log "WARN: Failed to install $name (left at $dest for inspection)"
+
+      if [ "$install_after_download" -eq 1 ]; then
+        STATUS["$name"]="Installing"
+        render_table
+        if pm_install_apk "$dest"; then
+          STATUS["$name"]="Installed"
+          DETAIL["$name"]="Installed and removed"
+          rm -f "$dest" || true
+          log "Installed $name successfully and deleted $dest"
+          ok_count=$((ok_count+1))
+        else
+          STATUS["$name"]="InstallFailed"
+          DETAIL["$name"]="$dest (left for inspection)"
+          log "WARN: Failed to install $name (left at $dest for inspection)"
+        fi
       fi
     else
+      STATUS["$name"]="DownloadFailed"
+      DETAIL["$name"]="Could not fetch"
+      render_table
       log "WARN: Could not download $name (skipping)"
-      rm -f "$dest"
+      rm -f "$dest" || true
     fi
   done
 
   log "APK task finished: $ok_count/$total installed"
+  read -rp "Press ENTER to continue..." _
 }
 
-# --------------- Main (one-shot) ---------------
+# ---------------- Menu ----------------
+show_menu() {
+  while true; do
+    render_table
+    cat <<-MENU
+Choose an action:
+ 1) Start: Download & Install all (one-shot)
+ 2) Download only (no install)
+ 3) Show current status (refresh)
+ 4) Set custom base URL (current: $BASE_URL)
+ 5) Load custom APK list (space-separated or newline file)
+ 6) Toggle auto-escalate to root with tsu (disabled by default)
+ 7) Clear downloaded APKs
+ 8) Exit
+MENU
+    read -rp "Enter choice [1-8]: " choice
+    case "$choice" in
+      1) download_and_maybe_install 1 ;;
+      2) download_and_maybe_install 0 ;;
+      3) render_table ; read -rp "Press ENTER to continue..." _ ;;
+      4)
+        read -rp "New base URL: " newurl
+        if [ -n "$newurl" ]; then BASE_URL="$newurl"; log "BASE_URL set to $BASE_URL"; fi ;;
+      5)
+        echo "Enter APK names separated by spaces (e.g. Foo.apk Bar.apk), or provide a path to a file containing one filename per line."
+        read -rp "Input or file path: " apkinput
+        if [ -f "$apkinput" ]; then
+          mapfile -t newlist < "$apkinput"
+        else
+          # split on spaces
+          read -r -a newlist <<< "$apkinput"
+        fi
+        if [ "${#newlist[@]}" -gt 0 ]; then
+          APK_NAMES=("\${newlist[@]}")
+          for name in "${APK_NAMES[@]}"; do
+            STATUS["$name"]="Pending"
+            DETAIL["$name"]=""
+          done
+          log "Loaded custom APK list: ${APK_NAMES[*]}"
+        fi ;;
+      6)
+        echo "The script will not auto-escalate by default. To enable re-exec under tsu, uncomment code in the script or implement as needed." ;;
+      7)
+        rm -f "$APK_DIR"/* 2>/dev/null || true
+        log "Cleared $APK_DIR"
+        for k in "${!STATUS[@]}"; do STATUS["$k"]="Pending"; DETAIL["$k"]=""; done
+        read -rp "Cleared downloaded APKs. Press ENTER to continue..." _ ;;
+      8) log "User requested exit"; exit 0 ;;
+      *) echo "Invalid choice"; sleep 1 ;;
+    esac
+  done
+}
+
+# ---------------- Entry ----------------
 main() {
-  # Uncomment the next line if you want the script to auto-escalate to tsu (original behavior)
-  # ensure_root
-
-  ensure_packages
-  ensure_storage
-
-  log "Cryptic one-shot orchestrator starting (derived from original)."
-
-  # Run APK task once and exit
-  task_apk_download_and_install
-
-  log "One-shot orchestrator finished. Exiting."
-  exit 0
+  echo "${APP_NAME} — interactive APK downloader/installer"
+  echo "Logs: $LOG_FILE"
+  show_menu
 }
 
-main "$@"
+main "$@" 
