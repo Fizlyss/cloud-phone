@@ -1,145 +1,388 @@
+#!/usr/bin/env bash
+#
+# Codex Panel v1.1 — Interactive downloader/installer with GitHub asset discovery
+# - Auto-detects Codex.N.apk assets from GitHub (releases/latest or all releases)
+# - Lets you choose indices to download/install (or auto-select all discovered)
+# - Saves user config (~/.codex_panel_cfg)
+# - Optional root via tsu for installations
+# - Logs to ~/codex_panel.log; errors are quieted to log but user sees friendly messages
+#
+# Usage: ./codex_panel.sh
+# Requirements: curl (required), jq (optional but recommended)
 
-#!/bin/bash
-# Codex Control Panel - Termux/Android Shell
-# Works on UGPhone, VMOS, Emulators
-# Author: ChatGPT
+# ---------------- defaults & files ----------------
+CFG="$HOME/.codex_panel_cfg"
+LOG="$HOME/codex_panel.log"
+TMPDIR="${TMPDIR:-/tmp}"
+WORKDIR="$HOME/codex_panel_work"
+mkdir -p "$WORKDIR"
 
-CONFIG="$HOME/.codex_config"
-LOG_FILE="$HOME/.codex_log"
+# sensible defaults if config not present
+DEFAULT_REPO="Fizlyss/cloud-phone"  # repo owner/name
+FROM_DEFAULT=0
+TO_DEFAULT=8
 
-# Defaults
-BASE_URL="https://github.com/Fizlyss/cloud-phone/releases/download/er"
-FROM=0
-TO=8
-SKIP=""
-USE_TSU=false
+# ---------------- helpers ----------------
+timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+log() { printf "[%s] %s\n" "$(timestamp)" "$*" >> "$LOG"; }
+quiet_curl() {
+  # curl wrapper: args forwarded, returns non-zero on failure.
+  # Saves response to stdout; any curl error logged to LOG (not shown to user)
+  local tmpf
+  tmpf="$(mktemp "$WORKDIR/curl.XXXXXX")"
+  if curl -fsSL "$@" -o "$tmpf"; then
+    cat "$tmpf"
+    rm -f "$tmpf"
+    return 0
+  else
+    # capture curl error details (try to get HTTP code or message)
+    echo "curl failed for: $*" >> "$LOG"
+    rm -f "$tmpf"
+    return 1
+  fi
+}
 
-# Load config if exists
-if [ -f "$CONFIG" ]; then
-    source "$CONFIG"
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || { echo "Missing required command: $1 (please install)"; return 1; }
+}
+
+# ---------------- config load/save ----------------
+load_cfg() {
+  # Default values
+  REPO="${DEFAULT_REPO}"
+  FROM="${FROM_DEFAULT}"
+  TO="${TO_DEFAULT}"
+  BASE_URL=""
+  USE_TSU=false
+
+  if [ -f "$CFG" ]; then
+    # shell-style config; safe-sourcing with fallback defaults
+    # load only known keys
+    while IFS='=' read -r key val; do
+      key="${key// /}"; val="${val#\"}"; val="${val%\"}"
+      case "$key" in
+        REPO) REPO="$val" ;;
+        FROM) FROM="$val" ;;
+        TO) TO="$val" ;;
+        BASE_URL) BASE_URL="$val" ;;
+        USE_TSU) USE_TSU="$val" ;;
+      esac
+    done < <(grep -E '^(REPO|FROM|TO|BASE_URL|USE_TSU)=' "$CFG" 2>/dev/null || true)
+  fi
+}
+
+save_cfg() {
+  cat > "$CFG" <<EOF
+REPO="${REPO}"
+FROM=${FROM}
+TO=${TO}
+BASE_URL="${BASE_URL}"
+USE_TSU=${USE_TSU}
+EOF
+  log "Saved config: REPO=${REPO}, FROM=${FROM}, TO=${TO}, BASE_URL='${BASE_URL}', USE_TSU=${USE_TSU}"
+  echo "✅ Saved."
+}
+
+# ---------------- github discovery ----------------
+discover_codex_assets_from_latest() {
+  # Try releases/latest first, then fallback to listing releases
+  local api_latest="https://api.github.com/repos/${REPO}/releases/latest"
+  local json
+  if ! json="$(quiet_curl "$api_latest")"; then
+    log "Failed to fetch releases/latest for $REPO"
+    return 1
+  fi
+
+  # Parse asset names for Codex.N.apk
+  if command -v jq >/dev/null 2>&1; then
+    echo "$json" | jq -r '.assets[].name' 2>/dev/null | grep -Eo '^Codex\.[0-9]+\.apk$' || true
+  else
+    # fallback: crude grep+sed (works for common JSON)
+    echo "$json" | tr -d '\r\n' | sed 's/},/}\n/g' | grep -o '"name":[^,}]*' | sed -E 's/"name":"([^"]+)".*/\1/' \
+      | grep -E '^Codex\.[0-9]+\.apk$' || true
+  fi
+}
+
+discover_codex_assets_from_all() {
+  # List releases (paginated by GitHub; default first page often sufficient)
+  local api_list="https://api.github.com/repos/${REPO}/releases?per_page=100"
+  local json
+  if ! json="$(quiet_curl "$api_list")"; then
+    log "Failed to fetch releases list for $REPO"
+    return 1
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    echo "$json" | jq -r '.[] | .assets[]?.name' 2>/dev/null | grep -Eo '^Codex\.[0-9]+\.apk$' || true
+  else
+    echo "$json" | tr -d '\r\n' | sed 's/},/}\n/g' | grep -o '"name":[^,}]*' | sed -E 's/"name":"([^"]+)".*/\1/' \
+      | grep -E '^Codex\.[0-9]+\.apk$' || true
+  fi
+}
+
+get_available_indices() {
+  # Return sorted unique numeric indices found from GitHub discovery or from BASE_URL pattern if set
+  local assets idxs all_assets
+  all_assets="$(discover_codex_assets_from_latest 2>/dev/null || true)"
+  if [ -z "$all_assets" ]; then
+    # fallback to all releases
+    all_assets="$(discover_codex_assets_from_all 2>/dev/null || true)"
+  fi
+
+  # If still empty and BASE_URL is set, try probing by range FROM..TO
+  if [ -z "$all_assets" ] && [ -n "$BASE_URL" ]; then
+    for i in $(seq "$FROM" "$TO"); do
+      # HEAD request to check existence
+      if curl -fsS -I -L "${BASE_URL}/Codex.${i}.apk" >/dev/null 2>&1; then
+        all_assets="$(printf '%s\n' "$all_assets" "Codex.${i}.apk")"
+      fi
+    done
+  fi
+
+  # Extract numeric indices
+  idxs="$(printf '%s\n' "$all_assets" | grep -Eo '[0-9]+' || true)"
+  # unique + sorted
+  printf '%s\n' $idxs 2>/dev/null | sort -n -u | tr '\n' ' ' | sed 's/ $//'
+}
+
+# ---------------- download & install ----------------
+download_codex_index() {
+  local i="$1" name="Codex.${i}.apk" url dest="$WORKDIR/$name"
+  if [ -n "$BASE_URL" ]; then
+    url="${BASE_URL%/}/$name"
+  else
+    # use GitHub release direct URL pattern pointing to 'er' tag from earlier messages if REPO matches Fizlyss/cloud-phone
+    # Attempt to construct a sensible URL: https://github.com/${REPO}/releases/download/er/Codex.N.apk
+    url="https://github.com/${REPO}/releases/download/er/$name"
+  fi
+
+  log "Attempting download: $url"
+  if quiet_curl "$url" -o "$dest"; then
+    log "Downloaded $name -> $dest"
+    echo "$dest"
+    return 0
+  else
+    # If GitHub API returned assets earlier we should try to obtain asset direct download via API (search assets for URL)
+    # But to keep the script conservative and robust, just report failure in log and return non-zero.
+    log "Download failed for $name from $url"
+    return 1
+  fi
+}
+
+install_apk_path() {
+  local apk_path="$1"
+  # prefer root direct pm if root; otherwise use tsu if available; else skip and inform user
+  if [ "$(id -u)" = "0" ] 2>/dev/null; then
+    if /system/bin/pm install -r "$apk_path" >> "$LOG" 2>&1; then
+      log "pm install succeeded for $apk_path"
+      return 0
+    else
+      log "pm install failed for $apk_path"
+      return 1
+    fi
+  elif [ "${USE_TSU}" = "true" ] && command -v tsu >/dev/null 2>&1; then
+    if tsu -c "/system/bin/pm install -r '$apk_path'" >> "$LOG" 2>&1; then
+      log "tsu pm install succeeded for $apk_path"
+      return 0
+    else
+      log "tsu pm install failed for $apk_path"
+      return 1
+    fi
+  else
+    log "Not root and tsu not used; skipped install for $apk_path"
+    return 2
+  fi
+}
+
+# ---------------- UI actions ----------------
+action_set_repo() {
+  echo "Enter GitHub repo (owner/repo). Current: ${REPO}"
+  read -r input
+  input="${input:-$REPO}"
+  REPO="$input"
+  # if user prefers a custom base URL for direct downloads:
+  echo "Optional: set custom BASE_URL (leave blank to use GitHub release URLs). Current: ${BASE_URL}"
+  read -r b
+  [ -n "$b" ] && BASE_URL="$b"
+  save_cfg
+}
+
+action_detect_and_choose() {
+  echo "Discovering available Codex APKs on GitHub for repo: ${REPO}..."
+  avail="$(get_available_indices)"
+  if [ -z "$avail" ]; then
+    echo "No Codex assets discovered automatically."
+    echo "You may either set a BASE_URL that hosts Codex.N.apk or set a manual range in Configure."
+    pause
+    return
+  fi
+
+  echo "Discovered Codex indices: $avail"
+  echo "Would you like to:"
+  echo "  1) Download & install all discovered indices"
+  echo "  2) Choose indices manually"
+  echo "  3) Cancel"
+  read -rp "Choice [1-3]: " ch
+  case "$ch" in
+    1)
+      to_download=($avail)
+      ;;
+    2)
+      echo "Enter indices to operate on separated by spaces (e.g. 0 1 2):"
+      read -r line
+      # validate
+      to_download=()
+      for token in $line; do
+        if [[ "$token" =~ ^[0-9]+$ ]]; then
+          to_download+=("$token")
+        fi
+      done
+      ;;
+    *) echo "Cancelled."; pause; return ;;
+  esac
+
+  # perform downloads
+  echo "Starting downloads for: ${to_download[*]}"
+  for idx in "${to_download[@]}"; do
+    echo "-> Codex.${idx}.apk ..."
+    if apk_path="$(download_codex_index "$idx")"; then
+      echo "Downloaded to $apk_path"
+      # attempt install
+      inst_res=$(install_apk_path "$apk_path" || true)
+      case "$?" in
+        0) echo "Installed Codex.${idx}.apk" ;;
+        1) echo "Install failed (see log). File kept at $apk_path" ;;
+        2) echo "Not installed (no root/tsu); file kept at $apk_path" ;;
+      esac
+    else
+      echo "Failed to download Codex.${idx}.apk (logged)."
+    fi
+  done
+  echo "Operation finished. See $LOG for details."
+  pause
+}
+
+action_manual_range() {
+  echo "Set download FROM index (current: $FROM):"
+  read -r f; f="${f:-$FROM}"
+  echo "Set download TO index (current: $TO):"
+  read -r t; t="${t:-$TO}"
+  if ! [[ "$f" =~ ^[0-9]+$ && "$t" =~ ^[0-9]+$ && "$f" -le "$t" ]]; then
+    echo "Invalid range. Aborted."
+    pause
+    return
+  fi
+  FROM="$f"; TO="$t"
+  save_cfg
+  echo "Range saved: $FROM..$TO"
+  pause
+}
+
+action_download_range() {
+  echo "Downloading indices in range $FROM..$TO (skip none)..."
+  for i in $(seq "$FROM" "$TO"); do
+    echo "-> Codex.${i}.apk ..."
+    if apk_path="$(download_codex_index "$i")"; then
+      echo "Downloaded to $apk_path"
+      install_apk_path "$apk_path" >/dev/null 2>&1 && echo "Installed." || echo "Install skipped/failed (see log)."
+    else
+      echo "Failed to download Codex.${i}.apk"
+    fi
+  done
+  echo "Done. Check $LOG for details."
+  pause
+}
+
+action_install_from_workdir() {
+  echo "Installing any Codex.*.apk found in $WORKDIR ..."
+  shopt -s nullglob
+  for apk in "$WORKDIR"/Codex.*.apk; do
+    echo "Installing $(basename "$apk") ..."
+    if install_apk_path "$apk"; then
+      echo "Installed $(basename "$apk")"
+      # optional: remove after success
+      rm -f "$apk" 2>/dev/null || true
+    else
+      echo "Install failed or skipped for $(basename "$apk") (see log)"
+    fi
+  done
+  pause
+}
+
+action_view_log() {
+  if [ -f "$LOG" ]; then
+    echo "---- Last 100 lines of log ($LOG) ----"
+    tail -n 100 "$LOG" || true
+    echo "---- Follow? (y/n) ----"
+    read -r f
+    if [ "${f,,}" = "y" ]; then
+      echo "(Ctrl-C to stop following)"
+      tail -f "$LOG"
+    fi
+  else
+    echo "No log file yet."
+  fi
+  pause
+}
+
+pause() {
+  echo -n "Press ENTER to continue..."
+  read -r _
+}
+
+# ---------------- startup checks ----------------
+# ensure curl available
+if ! command -v curl >/dev/null 2>&1; then
+  echo "Error: curl is required. Install it and re-run." >&2
+  exit 1
 fi
 
-# Helpers
-log() {
-    echo -e "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG_FILE"
-}
-save_config() {
-    cat > "$CONFIG" <<EOF
-BASE_URL="$BASE_URL"
-FROM=$FROM
-TO=$TO
-SKIP="$SKIP"
-USE_TSU=$USE_TSU
-EOF
-    log "✅ Config saved."
-}
-pause() {
-    echo -ne "\nPress enter to continue... "
-    read _
-}
+# load or create cfg
+load_cfg
 
-# Tasks
-task_download() {
-    log "📥 Downloading Codex APKs ($FROM → $TO)..."
-    for i in $(seq $FROM $TO); do
-        if [[ "$SKIP" =~ (^| )$i($| ) ]]; then
-            log "⏭️ Skipping Codex.$i.apk"
-            continue
-        fi
-        url="$BASE_URL/Codex.$i.apk"
-        file="Codex.$i.apk"
-        log "⬇️  $file"
-        curl -fsSL "$url" -o "$file" || log "❌ Failed to download $file"
-    done
-    log "✅ Download finished."
-    pause
-}
+# If repo empty, set default
+REPO="${REPO:-$DEFAULT_REPO}"
 
-task_install() {
-    log "📲 Installing Codex APKs..."
-    for file in Codex.*.apk; do
-        [ -f "$file" ] || continue
-        if $USE_TSU && command -v tsu >/dev/null 2>&1; then
-            tsu -c "pm install -r '$file'" >/dev/null 2>&1 && \
-            log "✅ Installed $file" || log "❌ Failed $file"
-        else
-            pm install -r "$file" >/dev/null 2>&1 && \
-            log "✅ Installed $file" || log "❌ Failed $file"
-        fi
-    done
-    pause
-}
-
-task_status() {
-    log "📊 Checking Codex APK status..."
-    for i in $(seq $FROM $TO); do
-        pkg="com.example.codex$i"
-        if pm list packages | grep -q "$pkg"; then
-            echo "[$i] ✅ Codex.$i installed"
-        else
-            echo "[$i] ❌ Codex.$i missing"
-        fi
-    done
-    pause
-}
-
-task_logs() {
-    less +G "$LOG_FILE"
-}
-
-task_configure() {
-    echo "Current source: $BASE_URL"
-    echo "Enter new BASE_URL (or leave empty to keep):"
-    read newurl
-    [ -n "$newurl" ] && BASE_URL="$newurl"
-
-    echo "Current range: $FROM - $TO"
-    echo "Enter FROM index:"
-    read newfrom
-    echo "Enter TO index:"
-    read newto
-    FROM=${newfrom:-$FROM}
-    TO=${newto:-$TO}
-
-    echo "Enter SKIP list (e.g. '5 7') or leave empty:"
-    read newskip
-    [ -n "$newskip" ] && SKIP="$newskip"
-
-    echo "Use tsu/root for install? (y/n)"
-    read ans
-    [[ "$ans" == "y" ]] && USE_TSU=true || USE_TSU=false
-
-    save_config
-    pause
-}
-
-# Menu
+# main menu loop
 while true; do
-    clear
-    echo "==============================="
-    echo "      📱 Codex Control Panel"
-    echo "==============================="
-    echo " Source: $BASE_URL"
-    echo " Range:  $FROM → $TO"
-    echo " Skip:   $SKIP"
-    echo " Root:   $USE_TSU"
-    echo
-    echo "1) Download Codex APKs"
-    echo "2) Install Codex APKs"
-    echo "3) Status of Codex APKs"
-    echo "4) View Logs"
-    echo "5) Configure Settings"
-    echo "6) Exit"
-    echo
-    echo -n "Choose an option: "
-    read choice
-    case $choice in
-        1) task_download ;;
-        2) task_install ;;
-        3) task_status ;;
-        4) task_logs ;;
-        5) task_configure ;;
-        6) exit 0 ;;
-        *) echo "Invalid option"; sleep 1 ;;
-    esac
+  clear
+  echo "========================================"
+  echo "     Codex Panel — GitHub Discovery"
+  echo "========================================"
+  echo "Repo:     $REPO"
+  echo "BASE_URL: ${BASE_URL:-(none)}"
+  echo "Range:    $FROM .. $TO"
+  echo "Use tsu:  ${USE_TSU:-false}"
+  echo "Workdir:  $WORKDIR"
+  echo
+  echo "1) Set GitHub repo / Base URL"
+  echo "2) Detect Codex assets on GitHub and choose to download/install"
+  echo "3) Download indices by manual range ($FROM..$TO)"
+  echo "4) Install any APKs in workdir"
+  echo "5) Install saved config (toggle tsu/root)"
+  echo "6) View logs"
+  echo "7) Edit & Save Config"
+  echo "8) Exit"
+  echo
+  read -rp "Choose [1-8]: " opt
+  case "$opt" in
+    1) action_set_repo ;;
+    2) action_detect_and_choose ;;
+    3) action_manual_range ;;
+    4) action_install_from_workdir ;;
+    5)
+       echo "Use tsu for installs? (y/n) current: ${USE_TSU}"
+       read -r x
+       if [ "${x,,}" = "y" ]; then USE_TSU=true; else USE_TSU=false; fi
+       save_cfg
+       ;;
+    6) action_view_log ;;
+    7)
+       echo "Edit config values now."
+       action_set_repo
+       echo "Also set numeric range (FROM/TO):"
+       action_manual_range
+       ;;
+    8) echo "Bye."; exit 0 ;;
+    *) echo "Invalid choice."; sleep 1 ;;
+  esac
 done
