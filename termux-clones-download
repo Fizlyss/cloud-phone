@@ -1,92 +1,91 @@
 #!/usr/bin/env bash
-# One-shot APK downloader (GitHub + GoFile support, skipping Codex.8/9)
+# One-shot: download & install Codex.0..Codex.8 from GitHub releases
+# No loop, no Termux:Boot, no workspace JSON changes.
 set -euo pipefail
 
-APK_URLS=(
-  "https://gofile.io/d/VI9Df6"
-)
+# Config: base release path and numeric range (inclusive)
+BASE_URL="https://github.com/Fizlyss/cloud-phone/releases/download/er"
+FROM=0
+TO=8
 
 # Paths
-LOG_DIR="$HOME/.local/share/cryptic_app_one_shot"
+LOG_DIR="$HOME/.local/share/cryptic_codex_one_shot"
 APK_DIR="$HOME/apks"
 TMP_DIR="$HOME/.tmp_cryptic"
 mkdir -p "$LOG_DIR" "$APK_DIR" "$TMP_DIR"
 LOG_FILE="$LOG_DIR/run.log"
 
-log(){ printf "[%s] %s\n" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*" | tee -a "$LOG_FILE"; }
+timestamp(){ date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+log(){ printf "[%s] %s\n" "$(timestamp)" "$*" | tee -a "$LOG_FILE"; }
 die(){ log "FATAL: $*"; exit 1; }
 
+# Simple http fetch with retries
 http_fetch_to(){
-  local url="$1" dest="$2"
-  curl -fsSL --retry 5 --retry-delay 2 -o "$dest" "$url" &>> "$LOG_FILE"
-}
-
-pm_install_apk(){
-  local apk="$1"
-  log "Installing $apk..."
-  (/system/bin/pm install -r -d --user 0 "$apk" \
-    || (cmd package install -r "$apk") \
-    || /system/bin/pm install "$apk") &>>"$LOG_FILE" \
-    && return 0 || return 1
-}
-
-gofile_download_content(){
-  local share_url="$1" out="$APK_DIR"
-  log "Processing GoFile share: $share_url"
-  id="${share_url##*/}"
-  token="$(curl -s https://api.gofile.io/createAccount | jq -r .data.token)"
-  wt="$(curl -s https://gofile.io/dist/js/alljs.js | grep -o "fetchData.wt[^=]*=[^;]*" | sed -E "s/.*=['\"]?([^'\";]+)['\"]?/\1/")"
-  resp="$(curl -s "https://api.gofile.io/getContent?contentId=$id&token=$token${wt:+&wt=$wt}&cache=true")"
-  if [ "$(jq -r .status <<< "$resp")" != "ok" ]; then
-    log "Failed to fetch GoFile content; status=$(jq -r .status <<< "$resp")"
+  local url="$1" dest="$2" tmp="${dest}.part"
+  rm -f "$tmp"
+  if curl -fsSL --retry 5 --retry-delay 2 --connect-timeout 20 -o "$tmp" "$url" &>>"$LOG_FILE"; then
+    mv -f "$tmp" "$dest"
+    return 0
+  else
+    rm -f "$tmp"
     return 1
   fi
-  curl -s -H "Cookie: accountToken=$token" "https://gofile.io/d/$id" -o /dev/null || true
-  for i in $(jq -r '.data.contents | keys[]' <<< "$resp"); do
-    name="$(jq -r ".data.contents[$i].name" <<< "$resp")"
-    link="$(jq -r ".data.contents[$i].link" <<< "$resp")"
-    [ -z "$link" ] && continue
-    # Skip Codex.8.apk and Codex.9.apk
-    if [[ "$name" = "Codex.8.apk" || "$name" = "Codex.9.apk" ]]; then
-      log "Skipping excluded: $name"
-      continue
-    fi
-    dest="$out/$name"
-    [ -f "$dest" ] && { log "Already exists, skipping: $name"; continue; }
-    log "Downloading $name"
-    curl -L -H "Cookie: accountToken=$token" -fsSL --retry 5 --retry-delay 2 -o "$dest" "$link" &>>"$LOG_FILE" \
-      && log "Saved $name" \
-      || { log "Failed: $name"; rm -f "$dest"; }
-  done
+}
+
+# Best-effort APK installer (tries multiple methods)
+pm_install_apk(){
+  local apk="$1"
+  log "Attempting install: $(basename "$apk")"
+  # try pm with typical flags (may require root)
+  if /system/bin/pm install -r -d --user 0 "$apk" >>"$LOG_FILE" 2>&1; then
+    return 0
+  fi
+  # fallback: cmd package
+  if command -v cmd >/dev/null 2>&1 && cmd package install -r "$apk" >>"$LOG_FILE" 2>&1; then
+    return 0
+  fi
+  # final fallback
+  if /system/bin/pm install "$apk" >>"$LOG_FILE" 2>&1; then
+    return 0
+  fi
+  return 1
 }
 
 main(){
-  log "One-shot downloader starting..."
-  for src in "${APK_URLS[@]}"; do
-    if [[ "$src" == *"gofile.io/d/"* ]]; then
-      gofile_download_content "$src"
+  log "One-shot Codex downloader/installer starting (range: $FROM..$TO)."
+
+  # check for required command
+  command -v curl >/dev/null 2>&1 || die "curl is required. Install with apt."
+
+  # Download loop 0..8
+  for i in $(seq "$FROM" "$TO"); do
+    name="Codex.${i}.apk"
+    url="${BASE_URL}/${name}"
+    dest="${APK_DIR}/${name}"
+    log "Fetching $name from $url"
+    if http_fetch_to "$url" "$dest"; then
+      log "Downloaded $name -> $dest"
     else
-      name="${src##*/}"
-      dest="$APK_DIR/$name"
-      http_fetch_to "$src" "$dest" \
-        && log "Downloaded $name" \
-        || log "Failed: $name"
+      log "WARN: Failed to download $name (skipping)"
+      rm -f "$dest"
     fi
   done
 
+  # Install any downloaded APKs
   shopt -s nullglob
-  ok=0 total=0
+  local ok=0 total=0
   for apk in "$APK_DIR"/*.apk; do
     total=$((total+1))
     if pm_install_apk "$apk"; then
-      log "Installed $apk"
+      log "Installed: $(basename "$apk")"
       rm -f "$apk"
       ok=$((ok+1))
     else
-      log "Install failed: $apk"
+      log "WARN: Install failed for $(basename "$apk") (left in $APK_DIR)"
     fi
   done
-  log "Done: Installed $ok/$total APKs"
+
+  log "Finished: installed $ok/$total APKs. Exiting."
 }
 
-main
+main "$@"
