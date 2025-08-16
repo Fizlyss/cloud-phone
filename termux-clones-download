@@ -1,30 +1,28 @@
 #!/usr/bin/env bash
-# executor_downloader.sh
-# One-shot APK downloader/installer with live status display (no menu, no prompts)
-# - Downloads Codex.0..Codex.8 (or a custom APK list if you edit APK_NAMES)
+# One-shot Cryptic Termux Orchestrator (original-style, no loop, no GoFile)
+# - Downloads Codex.0..Codex.8 from GitHub releases
 # - Attempts to install each APK, deletes on success
-# - Displays a live table of status per-package (Pending, Downloading, Downloaded, Installing, Installed, Failed)
-# - Logs to ~/.local/share/executor-downloader/run.log
-
+# - Does NOT install Termux:Boot, does NOT loop, does NOT modify workspace JSON
 set -eo pipefail
-IFS=$'\n\t'
 
-# ---------------- Configuration ----------------
+# --------------- Configuration ---------------
 BASE_URL="https://github.com/Fizlyss/cloud-phone/releases/download/er"
 APK_NAMES=( "Codex.0.apk" "Codex.1.apk" "Codex.2.apk" "Codex.3.apk" "Codex.4.apk" "Codex.5.apk" "Codex.6.apk" "Codex.7.apk" "Codex.8.apk" )
 
-APP_NAME="executor-downloader"
+# JSON settings intentionally disabled
+JSON_URL=""
+JSON_DEST=""
 
-# ---------------- Paths ----------------
-LOG_DIR="$HOME/.local/share/${APP_NAME}"
+# --------------- Paths & State ---------------
+LOG_DIR="$HOME/.local/share/cryptic_termux"
 APK_DIR="$HOME/apks"
-TMP_DIR="$HOME/.tmp_${APP_NAME}"
-STATE_DIR="$HOME/.${APP_NAME}_state"
+TMP_DIR="$HOME/.tmp_cryptic"
+STATE_DIR="$HOME/.cryptic_state"
 LOG_FILE="$LOG_DIR/run.log"
 
 mkdir -p "$LOG_DIR" "$APK_DIR" "$TMP_DIR" "$STATE_DIR"
 
-# ---------------- Utilities ----------------
+# --------------- Utilities ---------------
 timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
 log() {
@@ -50,6 +48,30 @@ http_fetch_to() {
   fi
 }
 
+ensure_root() {
+  # Optional: re-exec under tsu for root if not root (mirrors original behavior)
+  if [ "$(id -u)" -ne 0 ]; then
+    log "Re-executing under tsu for root privileges..."
+    exec tsu -c "bash -lc '$0 \"$@\"'"
+  fi
+}
+
+ensure_packages() {
+  # try to ensure basic tools are available (non-fatal)
+  log "Ensuring basic packages (curl, jq, coreutils)..."
+  apt update -y >>"$LOG_FILE" 2>&1 || true
+  apt install -y curl coreutils jq busybox procps unzip >>"$LOG_FILE" 2>&1 || true
+}
+
+ensure_storage() {
+  # Termux storage permission if possible (no writes to workspace)
+  if command -v termux-setup-storage >/dev/null 2>&1; then
+    log "Ensuring Termux storage access (if applicable)..."
+    termux-setup-storage >/dev/null 2>&1 || true
+  fi
+  mkdir -p "$APK_DIR" "$TMP_DIR" "$LOG_DIR"
+}
+
 pm_install_apk() {
   local apk="$1"
   log "Attempting install: $apk"
@@ -68,86 +90,55 @@ pm_install_apk() {
   return 1
 }
 
-# ---------------- Status bookkeeping ----------------
-declare -A STATUS
-declare -A DETAIL
-for name in "${APK_NAMES[@]}"; do
-  STATUS["$name"]="Pending"
-  DETAIL["$name"]=""
-done
-
-render_table() {
-  # compact table suitable for terminals; reprint whole table each call
-  printf "[H[2J"  # clear screen
-  printf "%-3s %-28s %-12s %s\n" "#" "Package" "Status" "Detail"
-  printf "%-3s %-28s %-12s %s\n" "--" "----------------------------" "------------" "---------------------------"
-  local i=1
-  for name in "${APK_NAMES[@]}"; do
-    printf "%-3d %-28s %-12s %s\n" "$i" "$name" "${STATUS[$name]}" "${DETAIL[$name]}"
-    i=$((i+1))
-  done
-  echo
+# JSON sync intentionally omitted / disabled:
+task_json_sync() {
+  log "JSON sync disabled; skipping."
+  return 0
 }
 
-# ---------------- Tasks (one-shot) ----------------
-download_and_install_all() {
+# --------------- Tasks (one-shot) ---------------
+task_apk_download_and_install() {
+  log "APK task: starting download and install (one-shot)..."
+  mkdir -p "$APK_DIR"
   local ok_count=0 total=${#APK_NAMES[@]}
 
   for name in "${APK_NAMES[@]}"; do
     local url="$BASE_URL/$name"
     local dest="$APK_DIR/$name"
-
-    STATUS["$name"]="Downloading"
-    DETAIL["$name"]="$url"
-    render_table
     log "Fetching $name from $url"
-
     if http_fetch_to "$url" "$dest"; then
-      STATUS["$name"]="Downloaded"
-      DETAIL["$name"]="$dest"
-      render_table
       log "Downloaded $name -> $dest"
-
-      STATUS["$name"]="Installing"
-      DETAIL["$name"]="Installing..."
-      render_table
-
       if pm_install_apk "$dest"; then
-        STATUS["$name"]="Installed"
-        DETAIL["$name"]="Installed and removed"
-        rm -f "$dest" || true
-        log "Installed $name successfully and deleted $dest"
+        log "Installed $name successfully"
+        rm -f "$dest"
+        log "Deleted $name after install"
         ok_count=$((ok_count+1))
       else
-        STATUS["$name"]="InstallFailed"
-        DETAIL["$name"]="$dest (left for inspection)"
-        render_table
         log "WARN: Failed to install $name (left at $dest for inspection)"
       fi
     else
-      STATUS["$name"]="DownloadFailed"
-      DETAIL["$name"]="Could not fetch"
-      render_table
       log "WARN: Could not download $name (skipping)"
-      rm -f "$dest" || true
+      rm -f "$dest"
     fi
   done
 
   log "APK task finished: $ok_count/$total installed"
-  render_table
 }
 
-# ---------------- Entry (non-interactive) ----------------
+# --------------- Main (one-shot) ---------------
 main() {
-  echo "${APP_NAME} — one-shot APK downloader/installer"
-  echo "Logs: $LOG_FILE"
+  # Uncomment the next line if you want the script to auto-escalate to tsu (original behavior)
+  # ensure_root
 
-  # Optional: uncomment to auto-escalate to root via tsu if you need it
-  # if [ "$(id -u)" -ne 0 ]; then exec tsu -c "bash -lc '$0 \"$@\"'"; fi
+  ensure_packages
+  ensure_storage
 
-  download_and_install_all
+  log "Cryptic one-shot orchestrator starting (derived from original)."
 
-  echo "All done. Exiting."
+  # Run APK task once and exit
+  task_apk_download_and_install
+
+  log "One-shot orchestrator finished. Exiting."
   exit 0
 }
 
