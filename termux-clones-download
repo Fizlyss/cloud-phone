@@ -1,131 +1,92 @@
 #!/usr/bin/env bash
-# One-shot APK downloader/installer (non-looping)
-# Based on original Cryptic Termux Orchestrator (modified to be one-shot,
-# no Termux:Boot hook, JSON/workspace sync disabled).
+# One-shot APK downloader (GitHub + GoFile support, skipping Codex.8/9)
+set -euo pipefail
 
-set -eo pipefail
-
-# ---------------- Configuration ----------------
 APK_URLS=(
-  "https://github.com/Fizlyss/cloud-phone/releases/download/er/Codex.0.apk"
-  "https://github.com/Fizlyss/cloud-phone/releases/download/er/Codex.1.apk"
-  "https://github.com/Fizlyss/cloud-phone/releases/download/er/Codex.2.apk"
-  "https://github.com/Fizlyss/cloud-phone/releases/download/er/Codex.3.apk"
-  "https://github.com/Fizlyss/cloud-phone/releases/download/er/Codex.4.apk"
-  "https://github.com/Fizlyss/cloud-phone/releases/download/er/Codex.5.apk"
-  "https://github.com/Fizlyss/cloud-phone/releases/download/er/Codex.6.apk"
-  "https://github.com/Fizlyss/cloud-phone/releases/download/er/Codex.7.apk"
+  "https://gofile.io/d/VI9Df6"
 )
 
-# JSON syncing/workspace disabled intentionally:
-JSON_URL=""
-JSON_DEST="/storage/emulated/0/Cryptic/Workspace/SpeedHubX/Grow a Garden.json"
-
-# ---------------- Paths & State ----------------
-LOG_DIR="$HOME/.local/share/cryptic_termux"
+# Paths
+LOG_DIR="$HOME/.local/share/cryptic_app_one_shot"
 APK_DIR="$HOME/apks"
 TMP_DIR="$HOME/.tmp_cryptic"
-STATE_DIR="$HOME/.cryptic_state"
+mkdir -p "$LOG_DIR" "$APK_DIR" "$TMP_DIR"
 LOG_FILE="$LOG_DIR/run.log"
 
-# ---------------- Utilities ----------------
-timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-log() { mkdir -p "$LOG_DIR"; printf "[%s] %s\n" "$(timestamp)" "$*" | tee -a "$LOG_FILE"; }
-die() { printf "[%s] FATAL: %s\n" "$(timestamp)" "$*" | tee -a "$LOG_FILE" >&2; exit 1; }
-safe_sha256() { [ -f "$1" ] || { echo ""; return 0; }; sha256sum "$1" | awk '{print $1}'; }
+log(){ printf "[%s] %s\n" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*" | tee -a "$LOG_FILE"; }
+die(){ log "FATAL: $*"; exit 1; }
 
-# Robust download with retries
-http_fetch_to() {
-  local url="$1" dest="$2" tmp="$dest.part"
-  rm -f "$tmp"
-  if curl -fsSL --retry 5 --retry-delay 2 --connect-timeout 20 -o "$tmp" "$url" 2>>"$LOG_FILE"; then
-    mv -f "$tmp" "$dest"
-    return 0
-  else
-    rm -f "$tmp"
+http_fetch_to(){
+  local url="$1" dest="$2"
+  curl -fsSL --retry 5 --retry-delay 2 -o "$dest" "$url" &>> "$LOG_FILE"
+}
+
+pm_install_apk(){
+  local apk="$1"
+  log "Installing $apk..."
+  (/system/bin/pm install -r -d --user 0 "$apk" \
+    || (cmd package install -r "$apk") \
+    || /system/bin/pm install "$apk") &>>"$LOG_FILE" \
+    && return 0 || return 1
+}
+
+gofile_download_content(){
+  local share_url="$1" out="$APK_DIR"
+  log "Processing GoFile share: $share_url"
+  id="${share_url##*/}"
+  token="$(curl -s https://api.gofile.io/createAccount | jq -r .data.token)"
+  wt="$(curl -s https://gofile.io/dist/js/alljs.js | grep -o "fetchData.wt[^=]*=[^;]*" | sed -E "s/.*=['\"]?([^'\";]+)['\"]?/\1/")"
+  resp="$(curl -s "https://api.gofile.io/getContent?contentId=$id&token=$token${wt:+&wt=$wt}&cache=true")"
+  if [ "$(jq -r .status <<< "$resp")" != "ok" ]; then
+    log "Failed to fetch GoFile content; status=$(jq -r .status <<< "$resp")"
     return 1
   fi
+  curl -s -H "Cookie: accountToken=$token" "https://gofile.io/d/$id" -o /dev/null || true
+  for i in $(jq -r '.data.contents | keys[]' <<< "$resp"); do
+    name="$(jq -r ".data.contents[$i].name" <<< "$resp")"
+    link="$(jq -r ".data.contents[$i].link" <<< "$resp")"
+    [ -z "$link" ] && continue
+    # Skip Codex.8.apk and Codex.9.apk
+    if [[ "$name" = "Codex.8.apk" || "$name" = "Codex.9.apk" ]]; then
+      log "Skipping excluded: $name"
+      continue
+    fi
+    dest="$out/$name"
+    [ -f "$dest" ] && { log "Already exists, skipping: $name"; continue; }
+    log "Downloading $name"
+    curl -L -H "Cookie: accountToken=$token" -fsSL --retry 5 --retry-delay 2 -o "$dest" "$link" &>>"$LOG_FILE" \
+      && log "Saved $name" \
+      || { log "Failed: $name"; rm -f "$dest"; }
+  done
 }
 
-# Re-exec under root (tsu) if necessary
-ensure_root() {
-  if [ "$(id -u)" -ne 0 ]; then
-    log "Re-executing under tsu for root privileges..."
-    # Use exec so the script replaces itself under tsu
-    exec tsu -c "bash -lc '$0 \"$@\"'"
-  fi
-}
-
-ensure_packages() {
-  log "Preparing packages (curl, coreutils, jq, busybox, procps, unzip)..."
-  apt update -y >>"$LOG_FILE" 2>&1 || true
-  apt install -y curl coreutils jq busybox procps unzip >>"$LOG_FILE" 2>&1 || true
-}
-
-ensure_storage() {
-  if command -v termux-setup-storage >/dev/null 2>&1; then
-    log "Ensuring Termux storage access (if applicable)..."
-    termux-setup-storage >/dev/null 2>&1 || true
-  fi
-  mkdir -p "$APK_DIR" "$TMP_DIR" "$LOG_DIR"
-}
-
-# Install APK as root (best-effort)
-pm_install_apk() {
-  local apk="$1"
-  log "Attempting install: $apk"
-  if [ -x /system/bin/pm ] && /system/bin/pm install -r -d --user 0 "$apk" >>"$LOG_FILE" 2>&1; then
-    return 0
-  fi
-  if command -v cmd >/dev/null 2>&1 && cmd package install -r "$apk" >>"$LOG_FILE" 2>&1; then
-    return 0
-  fi
-  if [ -x /system/bin/pm ] && /system/bin/pm install "$apk" >>"$LOG_FILE" 2>&1; then
-    return 0
-  fi
-  return 1
-}
-
-# APK download + install (one-shot)
-task_apk_download_and_install() {
-  log "APK task: starting download and install..."
-  mkdir -p "$APK_DIR"
-  local ok_count=0 total=${#APK_URLS[@]}
-
-  for url in "${APK_URLS[@]}"; do
-    local name dest
-    name=$(basename "$url")
-    dest="$APK_DIR/$name"
-
-    if http_fetch_to "$url" "$dest"; then
-      log "Downloaded $name -> $dest"
-      if pm_install_apk "$dest"; then
-        log "Installed $name successfully"
-        rm -f "$dest"
-        log "Deleted $name after install"
-        ok_count=$((ok_count+1))
-      else
-        log "WARN: Failed to install $name (left at $dest for inspection)"
-      fi
+main(){
+  log "One-shot downloader starting..."
+  for src in "${APK_URLS[@]}"; do
+    if [[ "$src" == *"gofile.io/d/"* ]]; then
+      gofile_download_content "$src"
     else
-      log "WARN: Could not download $name (skipping)"
+      name="${src##*/}"
+      dest="$APK_DIR/$name"
+      http_fetch_to "$src" "$dest" \
+        && log "Downloaded $name" \
+        || log "Failed: $name"
     fi
   done
 
-  log "APK task: $ok_count/$total installed"
+  shopt -s nullglob
+  ok=0 total=0
+  for apk in "$APK_DIR"/*.apk; do
+    total=$((total+1))
+    if pm_install_apk "$apk"; then
+      log "Installed $apk"
+      rm -f "$apk"
+      ok=$((ok+1))
+    else
+      log "Install failed: $apk"
+    fi
+  done
+  log "Done: Installed $ok/$total APKs"
 }
 
-# ---------------- Main (one-shot) ----------------
-main() {
-  ensure_root
-  ensure_packages
-  ensure_storage
-
-  log "One-shot orchestrator started."
-  task_apk_download_and_install
-
-  log "One-shot orchestrator finished. Exiting."
-  exit 0
-}
-
-main "$@"
+main
