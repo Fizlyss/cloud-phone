@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# Cryptic Termux Orchestrator
+# Android 10 / VMOS Cloud (root via tsu)
+# - APK install & cleanup
+# - JSON sync
+# - Triggered by raw GitHub workflow files (content hash change)
+# - Hooks to Termux Boot (if installed)
+# - Uses Termux private dirs for APKs
+
+# --------------- Configuration ---------------
+
+# APK sources (Termux private dir only, never /sdcard/Download for APKs)
+APK_URLS=(
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
+  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+)
+
+# JSON source and destination (replace contents)
+JSON_URL="https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/SpeedHubX.Config.json"
+JSON_DEST="/storage/emulated/0/Cryptic/Workspace/SpeedHubX/Grow a Garden.json"
+
+# Triggers (watch raw file content changes)
+TRIGGER_APK="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/.github/workflows/RefreshClones.yml"
+TRIGGER_JSON="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/.github/workflows/RefreshScript.yml"
+
+# Polling interval (seconds)
+POLL_INTERVAL=300
+
+# --------------- Paths & State ---------------
+LOG_DIR="$HOME/.local/share/cryptic_termux"
+STATE_DIR="$HOME/.cryptic_state"
+APK_DIR="$HOME/apks"
+TMP_DIR="$HOME/.tmp_cryptic"
+BOOT_DIR="$HOME/.termux/boot"
+
+APK_TRIGGER_SHA="$STATE_DIR/apk_trigger.sha256"
+JSON_TRIGGER_SHA="$STATE_DIR/json_trigger.sha256"
+FIRST_RUN_FLAG="$STATE_DIR/first_run.done"
+PKG_READY_FLAG="$STATE_DIR/pkg_ready.done"
+STORAGE_READY_FLAG="$STATE_DIR/storage_ready.done"
+
+LOG_FILE="$LOG_DIR/run.log"
+
+# --------------- Utilities ---------------
+tsu_exec() { tsu -c "$*"; }
+
+timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+log() {
+  mkdir -p "$LOG_DIR"
+  printf "[%s] %s\n" "$(timestamp)" "$*" | tee -a "$LOG_FILE"
+}
+
+die() {
+  printf "[%s] FATAL: %s\n" "$(timestamp)" "$*" | tee -a "$LOG_FILE" >&2
+  exit 1
+}
+
+safe_sha256() {
+  # Prints sha256 of file (or empty if missing)
+  [ -f "$1" ] || { echo ""; return 0; }
+  sha256sum "$1" | awk '{print $1}'
+}
+
+http_fetch_to() {
+  # Robust download with retries; avoids spewing curl 22 to stderr
+  # $1 url, $2 dest
+  local url="$1" dest="$2" tmp="$dest.part"
+  rm -f "$tmp"
+  # --retry-all-errors ensures retry on most transient issues
+  if curl -fsSL --retry 5 --retry-delay 2 --connect-timeout 20 --max-time 0 \
+       -o "$tmp" "$url" 2>>"$LOG_FILE"; then
+    mv -f "$tmp" "$dest"
+    return 0
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+fetch_trigger_hash() {
+  # $1 url -> prints sha256 of content (or empty on failure)
+  local url="$1" f="$TMP_DIR/trigger.$(echo "$url" | sha256sum | cut -d' ' -f1)"
+  mkdir -p "$TMP_DIR"
+  if http_fetch_to "$url" "$f"; then
+    safe_sha256 "$f"
+  else
+    echo ""
+  fi
+}
+
+ensure_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    # Re-exec under tsu to satisfy "Make it run on TSU"
+    log "Re-executing under tsu for root privileges..."
+    exec tsu -c "bash -lc '$0 \"$@\"'"
+  fi
+}
+
+ensure_packages() {
+  # Install once and mark ready
+  [ -f "$PKG_READY_FLAG" ] && return 0
+  log "Preparing packages (curl, coreutils, jq, busybox, procps, unzip)..."
+  apt update -y >>"$LOG_FILE" 2>&1 || true
+  apt install -y curl coreutils jq busybox procps unzip >>"$LOG_FILE" 2>&1 || true
+  touch "$PKG_READY_FLAG"
+}
+
+ensure_storage() {
+  # Termux storage permission; may require a one-time prompt
+  [ -f "$STORAGE_READY_FLAG" ] && return 0
+  if command -v termux-setup-storage >/dev/null 2>&1; then
+    log "Ensuring Termux storage access..."
+    termux-setup-storage >/dev/null 2>&1 || true
+  fi
+  mkdir -p "$APK_DIR" "$STATE_DIR" "$TMP_DIR" "$LOG_DIR"
+  touch "$STORAGE_READY_FLAG"
+}
+
+install_boot_hook() {
+  # Creates a Termux:Boot script that runs this from your raw URL each boot
+  # (Requires the Termux:Boot add-on to be installed)
+  mkdir -p "$BOOT_DIR"
+  local boot_script="$BOOT_DIR/cryptic_boot.sh"
+  cat > "$boot_script" <<'EOF'
+#!/data/data/com.termux/files/usr/bin/bash
+# Auto-fetch and run the latest orchestrator on boot
+# Adjust the URL if you host the script elsewhere.
+RAW_URL="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/cryptic_termux.txt"
+LOG_DIR="$HOME/.local/share/cryptic_termux"
+mkdir -p "$LOG_DIR"
+# Run detached
+nohup bash -lc "curl -fsSL \"$RAW_URL\" | bash" >> "$LOG_DIR/boot.log" 2>&1 &
+EOF
+  chmod +x "$boot_script"
+  log "Termux:Boot hook installed at $boot_script"
+}
+
+pm_install_apk() {
+  # Install APK as root with pm/cmd, best-effort, returns 0 on success
+  local apk="$1"
+  # Try pm first
+  if /system/bin/pm install -r -d --user 0 "$apk" >>"$LOG_FILE" 2>&1; then
+    return 0
+  fi
+  # Fallback via cmd package
+  if cmd package install -r "$apk" >>"$LOG_FILE" 2>&1; then
+    return 0
+  fi
+  # One more attempt without flags
+  if /system/bin/pm install "$apk" >>"$LOG_FILE" 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+task_apk_download_and_install() {
+  log "APK task: starting download and install..."
+  mkdir -p "$APK_DIR"
+  local ok_count=0 total=${#APK_URLS[@]}
+  for url in "${APK_URLS[@]}"; do
+    local name
+    name=$(basename "$url")
+    local dest="$APK_DIR/$name"
+    if http_fetch_to "$url" "$dest"; then
+      log "Downloaded $name"
+      if pm_install_apk "$dest"; then
+        log "Installed $name successfully"
+        rm -f "$dest"
+        log "Deleted $name after install"
+        ok_count=$((ok_count+1))
+      else
+        log "WARN: Failed install for $name (kept for troubleshooting)"
+      fi
+    else
+      log "WARN: Could not download $name (skipping)"
+    fi
+  done
+  log "APK task: $ok_count/$total installed"
+}
+
+task_json_sync() {
+  log "JSON task: syncing to '$JSON_DEST'..."
+  local tmp="$TMP_DIR/config.json"
+  if ! http_fetch_to "$JSON_URL" "$tmp"; then
+    log "WARN: JSON download failed (leaving current file untouched)"
+    return 0
+  fi
+  # Validate JSON (safely ignore if invalid)
+  if jq -e . "$tmp" >/dev/null 2>&1; then
+    :
+  else
+    log "WARN: Downloaded JSON invalid; not applying"
+    return 0
+  fi
+  # Ensure destination directory exists and write with root
+  local dest_dir dest_file
+  dest_dir="$(dirname "$JSON_DEST")"
+  dest_file="$JSON_DEST"
+  tsu_exec "mkdir -p \"$dest_dir\""
+  # Replace file contents atomically
+  local tmp_as="$TMP_DIR/ga.json"
+  cp -f "$tmp" "$tmp_as"
+  tsu_exec "cp -f \"$tmp_as\" \"$dest_file\""
+  log "JSON task: updated '$JSON_DEST'"
+}
+
+# --------------- Main Loop ---------------
+
+main() {
+  ensure_root
+  ensure_packages
+  ensure_storage
+  install_boot_hook
+
+  log "Cryptic orchestrator started."
+  log "First run behavior: APK + JSON tasks will execute once."
+
+  while true; do
+    local_busy=0
+
+    # First-run: do both tasks once
+    if [ ! -f "$FIRST_RUN_FLAG" ]; then
+      task_apk_download_and_install
+      task_json_sync
+      touch "$FIRST_RUN_FLAG"
+      local_busy=1
+    fi
+
+    # Check APK trigger
+    local new_apk_sha old_apk_sha
+    new_apk_sha="$(fetch_trigger_hash "$TRIGGER_APK")"
+    old_apk_sha="$( [ -f "$APK_TRIGGER_SHA" ] && cat "$APK_TRIGGER_SHA" || echo "" )"
+    if [ -n "$new_apk_sha" ] && [ "$new_apk_sha" != "$old_apk_sha" ]; then
+      log "Trigger: APK workflow change detected."
+      task_apk_download_and_install
+      echo "$new_apk_sha" > "$APK_TRIGGER_SHA"
+      local_busy=1
+    fi
+
+    # Check JSON trigger
+    local new_json_sha old_json_sha
+    new_json_sha="$(fetch_trigger_hash "$TRIGGER_JSON")"
+    old_json_sha="$( [ -f "$JSON_TRIGGER_SHA" ] && cat "$JSON_TRIGGER_SHA" || echo "" )"
+    if [ -n "$new_json_sha" ] && [ "$new_json_sha" != "$old_json_sha" ]; then
+      log "Trigger: JSON workflow change detected."
+      task_json_sync
+      echo "$new_json_sha" > "$JSON_TRIGGER_SHA"
+      local_busy=1
+    fi
+
+    # No foreground "Other" task; just sleep between cycles
+    log "Sleeping ${POLL_INTERVAL}s before next cycle..."
+    sleep "$POLL_INTERVAL"
+  done
+}
+
+main "$@"
