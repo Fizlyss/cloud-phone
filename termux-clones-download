@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # executor_downloader.sh
-# Interactive menu wrapper around a one-shot APK downloader/installer
-# - Shows status per-APK (Pending, Downloading, Downloaded, Installed, Failed)
-# - Default list: Codex.0..Codex.8 (same as original)
+# One-shot APK downloader/installer with live status display (no menu, no prompts)
+# - Downloads Codex.0..Codex.8 (or a custom APK list if you edit APK_NAMES)
+# - Attempts to install each APK, deletes on success
+# - Displays a live table of status per-package (Pending, Downloading, Downloaded, Installing, Installed, Failed)
 # - Logs to ~/.local/share/executor-downloader/run.log
-# - Designed to be readable and safe for Termux / standard Android shells
 
-set -euo pipefail
+set -eo pipefail
 IFS=$'\n\t'
 
 # ---------------- Configuration ----------------
@@ -53,12 +53,15 @@ http_fetch_to() {
 pm_install_apk() {
   local apk="$1"
   log "Attempting install: $apk"
+  # try pm with typical flags
   if /system/bin/pm install -r -d --user 0 "$apk" >>"$LOG_FILE" 2>&1; then
     return 0
   fi
+  # fallback via cmd
   if command -v cmd >/dev/null 2>&1 && cmd package install -r "$apk" >>"$LOG_FILE" 2>&1; then
     return 0
   fi
+  # final fallback
   if /system/bin/pm install "$apk" >>"$LOG_FILE" 2>&1; then
     return 0
   fi
@@ -74,7 +77,8 @@ for name in "${APK_NAMES[@]}"; do
 done
 
 render_table() {
-  clear
+  # compact table suitable for terminals; reprint whole table each call
+  printf "[H[2J"  # clear screen
   printf "%-3s %-28s %-12s %s\n" "#" "Package" "Status" "Detail"
   printf "%-3s %-28s %-12s %s\n" "--" "----------------------------" "------------" "---------------------------"
   local i=1
@@ -85,9 +89,8 @@ render_table() {
   echo
 }
 
-# ---------------- Tasks ----------------
-download_and_maybe_install() {
-  local install_after_download=${1:-1} # 1 = install after download, 0 = just download
+# ---------------- Tasks (one-shot) ----------------
+download_and_install_all() {
   local ok_count=0 total=${#APK_NAMES[@]}
 
   for name in "${APK_NAMES[@]}"; do
@@ -105,20 +108,21 @@ download_and_maybe_install() {
       render_table
       log "Downloaded $name -> $dest"
 
-      if [ "$install_after_download" -eq 1 ]; then
-        STATUS["$name"]="Installing"
+      STATUS["$name"]="Installing"
+      DETAIL["$name"]="Installing..."
+      render_table
+
+      if pm_install_apk "$dest"; then
+        STATUS["$name"]="Installed"
+        DETAIL["$name"]="Installed and removed"
+        rm -f "$dest" || true
+        log "Installed $name successfully and deleted $dest"
+        ok_count=$((ok_count+1))
+      else
+        STATUS["$name"]="InstallFailed"
+        DETAIL["$name"]="$dest (left for inspection)"
         render_table
-        if pm_install_apk "$dest"; then
-          STATUS["$name"]="Installed"
-          DETAIL["$name"]="Installed and removed"
-          rm -f "$dest" || true
-          log "Installed $name successfully and deleted $dest"
-          ok_count=$((ok_count+1))
-        else
-          STATUS["$name"]="InstallFailed"
-          DETAIL["$name"]="$dest (left for inspection)"
-          log "WARN: Failed to install $name (left at $dest for inspection)"
-        fi
+        log "WARN: Failed to install $name (left at $dest for inspection)"
       fi
     else
       STATUS["$name"]="DownloadFailed"
@@ -130,67 +134,21 @@ download_and_maybe_install() {
   done
 
   log "APK task finished: $ok_count/$total installed"
-  read -rp "Press ENTER to continue..." _
+  render_table
 }
 
-# ---------------- Menu ----------------
-show_menu() {
-  while true; do
-    render_table
-    cat <<-MENU
-Choose an action:
- 1) Start: Download & Install all (one-shot)
- 2) Download only (no install)
- 3) Show current status (refresh)
- 4) Set custom base URL (current: $BASE_URL)
- 5) Load custom APK list (space-separated or newline file)
- 6) Toggle auto-escalate to root with tsu (disabled by default)
- 7) Clear downloaded APKs
- 8) Exit
-MENU
-    read -rp "Enter choice [1-8]: " choice
-    case "$choice" in
-      1) download_and_maybe_install 1 ;;
-      2) download_and_maybe_install 0 ;;
-      3) render_table ; read -rp "Press ENTER to continue..." _ ;;
-      4)
-        read -rp "New base URL: " newurl
-        if [ -n "$newurl" ]; then BASE_URL="$newurl"; log "BASE_URL set to $BASE_URL"; fi ;;
-      5)
-        echo "Enter APK names separated by spaces (e.g. Foo.apk Bar.apk), or provide a path to a file containing one filename per line."
-        read -rp "Input or file path: " apkinput
-        if [ -f "$apkinput" ]; then
-          mapfile -t newlist < "$apkinput"
-        else
-          # split on spaces
-          read -r -a newlist <<< "$apkinput"
-        fi
-        if [ "${#newlist[@]}" -gt 0 ]; then
-          APK_NAMES=("\${newlist[@]}")
-          for name in "${APK_NAMES[@]}"; do
-            STATUS["$name"]="Pending"
-            DETAIL["$name"]=""
-          done
-          log "Loaded custom APK list: ${APK_NAMES[*]}"
-        fi ;;
-      6)
-        echo "The script will not auto-escalate by default. To enable re-exec under tsu, uncomment code in the script or implement as needed." ;;
-      7)
-        rm -f "$APK_DIR"/* 2>/dev/null || true
-        log "Cleared $APK_DIR"
-        for k in "${!STATUS[@]}"; do STATUS["$k"]="Pending"; DETAIL["$k"]=""; done
-        read -rp "Cleared downloaded APKs. Press ENTER to continue..." _ ;;
-      8) log "User requested exit"; exit 0 ;;
-      *) echo "Invalid choice"; sleep 1 ;;
-    esac
-  done
-}
-
-# ---------------- Entry ----------------
+# ---------------- Entry (non-interactive) ----------------
 main() {
-  echo "${APP_NAME} — interactive APK downloader/installer"
+  echo "${APP_NAME} — one-shot APK downloader/installer"
   echo "Logs: $LOG_FILE"
-  show_menu
+
+  # Optional: uncomment to auto-escalate to root via tsu if you need it
+  # if [ "$(id -u)" -ne 0 ]; then exec tsu -c "bash -lc '$0 \"$@\"'"; fi
+
+  download_and_install_all
+
+  echo "All done. Exiting."
+  exit 0
 }
 
-main "$@" 
+main "$@"
