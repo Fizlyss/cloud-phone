@@ -26,8 +26,8 @@ JSON_URL="" --config for script
 JSON_DEST="/storage/emulated/0/Cryptic/Workspace/SpeedHubX/Grow a Garden.json"
 
 # Triggers (watch raw file content changes)
-TRIGGER_APK= "" -- "https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/.github/workflows/RefreshClones.yml"
-TRIGGER_JSON= "" -- "https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/.github/workflows/RefreshScript.yml"
+TRIGGER_APK= "https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/.github/workflows/RefreshClones.yml"
+TRIGGER_JSON= "https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/.github/workflows/RefreshScript.yml"
 
 # Polling interval (seconds)
 POLL_INTERVAL=50
