@@ -11,26 +11,26 @@
 
 # APK sources (Termux private dir only, never /sdcard/Download for APKs)
 APK_URLS=(
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.0.apk"
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.1.apk"
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.2.apk"
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.3.apk"
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.4.apk"
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.5.apk"
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.6.apk"
-  "https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/Cryptic.7.apk"
+  "https://github.com/Fizlyss/cloud-phone/releases/download/er/Codex.0.apk"
+  "https://github.com/Fizlyss/cloud-phone/releases/download/er/Codex.1.apk"
+  "https://github.com/Fizlyss/cloud-phone/releases/download/er/Codex.2.apk"
+  "https://github.com/Fizlyss/cloud-phone/releases/download/er/Codex.3.apk"
+  "https://github.com/Fizlyss/cloud-phone/releases/download/er/Codex.4.apk"
+  "https://github.com/Fizlyss/cloud-phone/releases/download/er/Codex.5.apk"
+  "https://github.com/Fizlyss/cloud-phone/releases/download/er/Codex.6.apk"
+  "https://github.com/Fizlyss/cloud-phone/releases/download/er/Codex.7.apk"
 )
 
 # JSON source and destination (replace contents)
-JSON_URL="https://github.com/Anrd5/MyAppCollection/releases/download/V1.0/SpeedHubX.Config.json"
+JSON_URL="" --config for script
 JSON_DEST="/storage/emulated/0/Cryptic/Workspace/SpeedHubX/Grow a Garden.json"
 
 # Triggers (watch raw file content changes)
-TRIGGER_APK="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/.github/workflows/RefreshClones.yml"
-TRIGGER_JSON="https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/.github/workflows/RefreshScript.yml"
+TRIGGER_APK= "" -- "https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/.github/workflows/RefreshClones.yml"
+TRIGGER_JSON= "" -- "https://raw.githubusercontent.com/Anrd5/MyAppCollection/refs/heads/main/.github/workflows/RefreshScript.yml"
 
 # Polling interval (seconds)
-POLL_INTERVAL=300
+POLL_INTERVAL=50
 
 # --------------- Paths & State ---------------
 LOG_DIR="$HOME/.local/share/cryptic_termux"
