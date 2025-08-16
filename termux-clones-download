@@ -1,145 +1,145 @@
-#!/usr/bin/env bash
-# One-shot Cryptic Termux Orchestrator (original-style, no loop, no GoFile)
-# - Downloads Codex.0..Codex.8 from GitHub releases
-# - Attempts to install each APK, deletes on success
-# - Does NOT install Termux:Boot, does NOT loop, does NOT modify workspace JSON
-set -eo pipefail
 
-# --------------- Configuration ---------------
+#!/bin/bash
+# Codex Control Panel - Termux/Android Shell
+# Works on UGPhone, VMOS, Emulators
+# Author: ChatGPT
+
+CONFIG="$HOME/.codex_config"
+LOG_FILE="$HOME/.codex_log"
+
+# Defaults
 BASE_URL="https://github.com/Fizlyss/cloud-phone/releases/download/er"
-APK_NAMES=( "Codex.0.apk" "Codex.1.apk" "Codex.2.apk" "Codex.3.apk" "Codex.4.apk" "Codex.5.apk" "Codex.6.apk" "Codex.7.apk" "Codex.8.apk" )
+FROM=0
+TO=8
+SKIP=""
+USE_TSU=false
 
-# JSON settings intentionally disabled
-JSON_URL=""
-JSON_DEST=""
+# Load config if exists
+if [ -f "$CONFIG" ]; then
+    source "$CONFIG"
+fi
 
-# --------------- Paths & State ---------------
-LOG_DIR="$HOME/.local/share/cryptic_termux"
-APK_DIR="$HOME/apks"
-TMP_DIR="$HOME/.tmp_cryptic"
-STATE_DIR="$HOME/.cryptic_state"
-LOG_FILE="$LOG_DIR/run.log"
-
-mkdir -p "$LOG_DIR" "$APK_DIR" "$TMP_DIR" "$STATE_DIR"
-
-# --------------- Utilities ---------------
-timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-
+# Helpers
 log() {
-  mkdir -p "$LOG_DIR"
-  printf "[%s] %s\n" "$(timestamp)" "$*" | tee -a "$LOG_FILE"
+    echo -e "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG_FILE"
+}
+save_config() {
+    cat > "$CONFIG" <<EOF
+BASE_URL="$BASE_URL"
+FROM=$FROM
+TO=$TO
+SKIP="$SKIP"
+USE_TSU=$USE_TSU
+EOF
+    log "✅ Config saved."
+}
+pause() {
+    echo -ne "\nPress enter to continue... "
+    read _
 }
 
-die() {
-  printf "[%s] FATAL: %s\n" "$(timestamp)" "$*" | tee -a "$LOG_FILE" >&2
-  exit 1
+# Tasks
+task_download() {
+    log "📥 Downloading Codex APKs ($FROM → $TO)..."
+    for i in $(seq $FROM $TO); do
+        if [[ "$SKIP" =~ (^| )$i($| ) ]]; then
+            log "⏭️ Skipping Codex.$i.apk"
+            continue
+        fi
+        url="$BASE_URL/Codex.$i.apk"
+        file="Codex.$i.apk"
+        log "⬇️  $file"
+        curl -fsSL "$url" -o "$file" || log "❌ Failed to download $file"
+    done
+    log "✅ Download finished."
+    pause
 }
 
-http_fetch_to() {
-  # $1 url, $2 dest
-  local url="$1" dest="$2" tmp="${dest}.part"
-  rm -f "$tmp"
-  if curl -fsSL --retry 5 --retry-delay 2 --connect-timeout 20 -o "$tmp" "$url" 2>>"$LOG_FILE"; then
-    mv -f "$tmp" "$dest"
-    return 0
-  else
-    rm -f "$tmp"
-    return 1
-  fi
+task_install() {
+    log "📲 Installing Codex APKs..."
+    for file in Codex.*.apk; do
+        [ -f "$file" ] || continue
+        if $USE_TSU && command -v tsu >/dev/null 2>&1; then
+            tsu -c "pm install -r '$file'" >/dev/null 2>&1 && \
+            log "✅ Installed $file" || log "❌ Failed $file"
+        else
+            pm install -r "$file" >/dev/null 2>&1 && \
+            log "✅ Installed $file" || log "❌ Failed $file"
+        fi
+    done
+    pause
 }
 
-ensure_root() {
-  # Optional: re-exec under tsu for root if not root (mirrors original behavior)
-  if [ "$(id -u)" -ne 0 ]; then
-    log "Re-executing under tsu for root privileges..."
-    exec tsu -c "bash -lc '$0 \"$@\"'"
-  fi
+task_status() {
+    log "📊 Checking Codex APK status..."
+    for i in $(seq $FROM $TO); do
+        pkg="com.example.codex$i"
+        if pm list packages | grep -q "$pkg"; then
+            echo "[$i] ✅ Codex.$i installed"
+        else
+            echo "[$i] ❌ Codex.$i missing"
+        fi
+    done
+    pause
 }
 
-ensure_packages() {
-  # try to ensure basic tools are available (non-fatal)
-  log "Ensuring basic packages (curl, jq, coreutils)..."
-  apt update -y >>"$LOG_FILE" 2>&1 || true
-  apt install -y curl coreutils jq busybox procps unzip >>"$LOG_FILE" 2>&1 || true
+task_logs() {
+    less +G "$LOG_FILE"
 }
 
-ensure_storage() {
-  # Termux storage permission if possible (no writes to workspace)
-  if command -v termux-setup-storage >/dev/null 2>&1; then
-    log "Ensuring Termux storage access (if applicable)..."
-    termux-setup-storage >/dev/null 2>&1 || true
-  fi
-  mkdir -p "$APK_DIR" "$TMP_DIR" "$LOG_DIR"
+task_configure() {
+    echo "Current source: $BASE_URL"
+    echo "Enter new BASE_URL (or leave empty to keep):"
+    read newurl
+    [ -n "$newurl" ] && BASE_URL="$newurl"
+
+    echo "Current range: $FROM - $TO"
+    echo "Enter FROM index:"
+    read newfrom
+    echo "Enter TO index:"
+    read newto
+    FROM=${newfrom:-$FROM}
+    TO=${newto:-$TO}
+
+    echo "Enter SKIP list (e.g. '5 7') or leave empty:"
+    read newskip
+    [ -n "$newskip" ] && SKIP="$newskip"
+
+    echo "Use tsu/root for install? (y/n)"
+    read ans
+    [[ "$ans" == "y" ]] && USE_TSU=true || USE_TSU=false
+
+    save_config
+    pause
 }
 
-pm_install_apk() {
-  local apk="$1"
-  log "Attempting install: $apk"
-  # try pm with typical flags
-  if /system/bin/pm install -r -d --user 0 "$apk" >>"$LOG_FILE" 2>&1; then
-    return 0
-  fi
-  # fallback via cmd
-  if command -v cmd >/dev/null 2>&1 && cmd package install -r "$apk" >>"$LOG_FILE" 2>&1; then
-    return 0
-  fi
-  # final fallback
-  if /system/bin/pm install "$apk" >>"$LOG_FILE" 2>&1; then
-    return 0
-  fi
-  return 1
-}
-
-# JSON sync intentionally omitted / disabled:
-task_json_sync() {
-  log "JSON sync disabled; skipping."
-  return 0
-}
-
-# --------------- Tasks (one-shot) ---------------
-task_apk_download_and_install() {
-  log "APK task: starting download and install (one-shot)..."
-  mkdir -p "$APK_DIR"
-  local ok_count=0 total=${#APK_NAMES[@]}
-
-  for name in "${APK_NAMES[@]}"; do
-    local url="$BASE_URL/$name"
-    local dest="$APK_DIR/$name"
-    log "Fetching $name from $url"
-    if http_fetch_to "$url" "$dest"; then
-      log "Downloaded $name -> $dest"
-      if pm_install_apk "$dest"; then
-        log "Installed $name successfully"
-        rm -f "$dest"
-        log "Deleted $name after install"
-        ok_count=$((ok_count+1))
-      else
-        log "WARN: Failed to install $name (left at $dest for inspection)"
-      fi
-    else
-      log "WARN: Could not download $name (skipping)"
-      rm -f "$dest"
-    fi
-  done
-
-  log "APK task finished: $ok_count/$total installed"
-}
-
-# --------------- Main (one-shot) ---------------
-main() {
-  # Uncomment the next line if you want the script to auto-escalate to tsu (original behavior)
-  # ensure_root
-
-  ensure_packages
-  ensure_storage
-
-  log "Cryptic one-shot orchestrator starting (derived from original)."
-
-  # Run APK task once and exit
-  task_apk_download_and_install
-
-  log "One-shot orchestrator finished. Exiting."
-  exit 0
-}
-
-main "$@"
+# Menu
+while true; do
+    clear
+    echo "==============================="
+    echo "      📱 Codex Control Panel"
+    echo "==============================="
+    echo " Source: $BASE_URL"
+    echo " Range:  $FROM → $TO"
+    echo " Skip:   $SKIP"
+    echo " Root:   $USE_TSU"
+    echo
+    echo "1) Download Codex APKs"
+    echo "2) Install Codex APKs"
+    echo "3) Status of Codex APKs"
+    echo "4) View Logs"
+    echo "5) Configure Settings"
+    echo "6) Exit"
+    echo
+    echo -n "Choose an option: "
+    read choice
+    case $choice in
+        1) task_download ;;
+        2) task_install ;;
+        3) task_status ;;
+        4) task_logs ;;
+        5) task_configure ;;
+        6) exit 0 ;;
+        *) echo "Invalid option"; sleep 1 ;;
+    esac
+done
