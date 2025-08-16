@@ -1,29 +1,45 @@
 #!/usr/bin/env bash
-# One-shot: download & install Codex.0..Codex.8 from GitHub releases
-# No loop, no Termux:Boot, no workspace JSON changes.
-set -euo pipefail
+# One-shot Cryptic Termux Orchestrator (original-style, no loop, no GoFile)
+# - Downloads Codex.0..Codex.8 from GitHub releases
+# - Attempts to install each APK, deletes on success
+# - Does NOT install Termux:Boot, does NOT loop, does NOT modify workspace JSON
+set -eo pipefail
 
-# Config: base release path and numeric range (inclusive)
+# --------------- Configuration ---------------
 BASE_URL="https://github.com/Fizlyss/cloud-phone/releases/download/er"
-FROM=0
-TO=8
+APK_NAMES=( "Codex.0.apk" "Codex.1.apk" "Codex.2.apk" "Codex.3.apk" "Codex.4.apk" "Codex.5.apk" "Codex.6.apk" "Codex.7.apk" "Codex.8.apk" )
 
-# Paths
-LOG_DIR="$HOME/.local/share/cryptic_codex_one_shot"
+# JSON settings intentionally disabled
+JSON_URL=""
+JSON_DEST=""
+
+# --------------- Paths & State ---------------
+LOG_DIR="$HOME/.local/share/cryptic_termux"
 APK_DIR="$HOME/apks"
 TMP_DIR="$HOME/.tmp_cryptic"
-mkdir -p "$LOG_DIR" "$APK_DIR" "$TMP_DIR"
+STATE_DIR="$HOME/.cryptic_state"
 LOG_FILE="$LOG_DIR/run.log"
 
-timestamp(){ date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-log(){ printf "[%s] %s\n" "$(timestamp)" "$*" | tee -a "$LOG_FILE"; }
-die(){ log "FATAL: $*"; exit 1; }
+mkdir -p "$LOG_DIR" "$APK_DIR" "$TMP_DIR" "$STATE_DIR"
 
-# Simple http fetch with retries
-http_fetch_to(){
+# --------------- Utilities ---------------
+timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+log() {
+  mkdir -p "$LOG_DIR"
+  printf "[%s] %s\n" "$(timestamp)" "$*" | tee -a "$LOG_FILE"
+}
+
+die() {
+  printf "[%s] FATAL: %s\n" "$(timestamp)" "$*" | tee -a "$LOG_FILE" >&2
+  exit 1
+}
+
+http_fetch_to() {
+  # $1 url, $2 dest
   local url="$1" dest="$2" tmp="${dest}.part"
   rm -f "$tmp"
-  if curl -fsSL --retry 5 --retry-delay 2 --connect-timeout 20 -o "$tmp" "$url" &>>"$LOG_FILE"; then
+  if curl -fsSL --retry 5 --retry-delay 2 --connect-timeout 20 -o "$tmp" "$url" 2>>"$LOG_FILE"; then
     mv -f "$tmp" "$dest"
     return 0
   else
@@ -32,15 +48,38 @@ http_fetch_to(){
   fi
 }
 
-# Best-effort APK installer (tries multiple methods)
-pm_install_apk(){
+ensure_root() {
+  # Optional: re-exec under tsu for root if not root (mirrors original behavior)
+  if [ "$(id -u)" -ne 0 ]; then
+    log "Re-executing under tsu for root privileges..."
+    exec tsu -c "bash -lc '$0 \"$@\"'"
+  fi
+}
+
+ensure_packages() {
+  # try to ensure basic tools are available (non-fatal)
+  log "Ensuring basic packages (curl, jq, coreutils)..."
+  apt update -y >>"$LOG_FILE" 2>&1 || true
+  apt install -y curl coreutils jq busybox procps unzip >>"$LOG_FILE" 2>&1 || true
+}
+
+ensure_storage() {
+  # Termux storage permission if possible (no writes to workspace)
+  if command -v termux-setup-storage >/dev/null 2>&1; then
+    log "Ensuring Termux storage access (if applicable)..."
+    termux-setup-storage >/dev/null 2>&1 || true
+  fi
+  mkdir -p "$APK_DIR" "$TMP_DIR" "$LOG_DIR"
+}
+
+pm_install_apk() {
   local apk="$1"
-  log "Attempting install: $(basename "$apk")"
-  # try pm with typical flags (may require root)
+  log "Attempting install: $apk"
+  # try pm with typical flags
   if /system/bin/pm install -r -d --user 0 "$apk" >>"$LOG_FILE" 2>&1; then
     return 0
   fi
-  # fallback: cmd package
+  # fallback via cmd
   if command -v cmd >/dev/null 2>&1 && cmd package install -r "$apk" >>"$LOG_FILE" 2>&1; then
     return 0
   fi
@@ -51,41 +90,56 @@ pm_install_apk(){
   return 1
 }
 
-main(){
-  log "One-shot Codex downloader/installer starting (range: $FROM..$TO)."
+# JSON sync intentionally omitted / disabled:
+task_json_sync() {
+  log "JSON sync disabled; skipping."
+  return 0
+}
 
-  # check for required command
-  command -v curl >/dev/null 2>&1 || die "curl is required. Install with apt."
+# --------------- Tasks (one-shot) ---------------
+task_apk_download_and_install() {
+  log "APK task: starting download and install (one-shot)..."
+  mkdir -p "$APK_DIR"
+  local ok_count=0 total=${#APK_NAMES[@]}
 
-  # Download loop 0..8
-  for i in $(seq "$FROM" "$TO"); do
-    name="Codex.${i}.apk"
-    url="${BASE_URL}/${name}"
-    dest="${APK_DIR}/${name}"
+  for name in "${APK_NAMES[@]}"; do
+    local url="$BASE_URL/$name"
+    local dest="$APK_DIR/$name"
     log "Fetching $name from $url"
     if http_fetch_to "$url" "$dest"; then
       log "Downloaded $name -> $dest"
+      if pm_install_apk "$dest"; then
+        log "Installed $name successfully"
+        rm -f "$dest"
+        log "Deleted $name after install"
+        ok_count=$((ok_count+1))
+      else
+        log "WARN: Failed to install $name (left at $dest for inspection)"
+      fi
     else
-      log "WARN: Failed to download $name (skipping)"
+      log "WARN: Could not download $name (skipping)"
       rm -f "$dest"
     fi
   done
 
-  # Install any downloaded APKs
-  shopt -s nullglob
-  local ok=0 total=0
-  for apk in "$APK_DIR"/*.apk; do
-    total=$((total+1))
-    if pm_install_apk "$apk"; then
-      log "Installed: $(basename "$apk")"
-      rm -f "$apk"
-      ok=$((ok+1))
-    else
-      log "WARN: Install failed for $(basename "$apk") (left in $APK_DIR)"
-    fi
-  done
+  log "APK task finished: $ok_count/$total installed"
+}
 
-  log "Finished: installed $ok/$total APKs. Exiting."
+# --------------- Main (one-shot) ---------------
+main() {
+  # Uncomment the next line if you want the script to auto-escalate to tsu (original behavior)
+  # ensure_root
+
+  ensure_packages
+  ensure_storage
+
+  log "Cryptic one-shot orchestrator starting (derived from original)."
+
+  # Run APK task once and exit
+  task_apk_download_and_install
+
+  log "One-shot orchestrator finished. Exiting."
+  exit 0
 }
 
 main "$@"
