@@ -134,7 +134,7 @@ main() {
   ensure_packages
   ensure_storage
 
-  log "Cryptic one-shot orchestrator starting (derived from original)."
+  log "codex one-shot orchestrator starting (derived from original)."
 
   # Run APK task once and exit
   task_apk_download_and_install
