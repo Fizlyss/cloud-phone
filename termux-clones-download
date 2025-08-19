@@ -8,7 +8,7 @@ set -eo pipefail
 
 # --------------- Configuration ---------------
 BASE_URL="https://github.com/Fizlyss/cloud-phone/releases/download/er"
-APK_NAMES=( "Codex.0.apk" "Codex.1.apk" "Codex.2.apk" "Codex.3.apk" "Codex.4.apk" "Codex.5.apk" "Codex.6.apk" "Codex.7.apk" "Codex.8.apk" )
+APK_NAMES=( "Codex.0.apk" "Codex.1.apk" "Codex.2.apk" "Codex.3.apk" "Codex.4.apk" "Codex.5.apk" "Codex.6.apk" "Codex.7.apk" )
 
 # JSON settings intentionally disabled
 JSON_URL=""
