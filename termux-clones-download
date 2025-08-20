@@ -1,314 +1,146 @@
 #!/usr/bin/env bash
-# One-Shot Clones Downloader — installer + polished UI
-# Usage:
-#   bash downloader.sh           # run ad-hoc
-#   bash downloader.sh --install # install to ~/bin/oneshot (one-time) -> run with `oneshot`
+# One-shot Cryptic Termux Orchestrator (with update support)
+# - Downloads Codex.0..Codex.7 from GitHub releases
+# - Installs or updates each APK, deletes on success
+# - Does NOT install Termux:Boot, does NOT loop, does NOT modify workspace JSON
+set -eo pipefail
 
-set -euo pipefail
+# --------------- Configuration ---------------
+BASE_URL="https://github.com/Fizlyss/cloud-phone/releases/download/er"
+APK_NAMES=( "Codex.0.apk" "Codex.1.apk" "Codex.2.apk" "Codex.3.apk" "Codex.4.apk" "Codex.5.apk" "Codex.6.apk" "Codex.7.apk" )
 
-# ---------------- ensure bash ----------------
-if [ -z "${BASH_VERSION:-}" ]; then
-  exec bash "$0" "$@"
-fi
+# JSON settings intentionally disabled
+JSON_URL=""
+JSON_DEST=""
 
-SELF_PATH="$(realpath "$0")"
-INSTALL_TARGET="$HOME/bin/oneshot"   # install target (user ~/bin)
-PROFILE_FILES=( "$HOME/.profile" "$HOME/.bashrc" )
-
-# ---------------- paths & config ----------------
+# --------------- Paths & State ---------------
 LOG_DIR="$HOME/.local/share/cryptic_termux"
 APK_DIR="$HOME/apks"
 TMP_DIR="$HOME/.tmp_cryptic"
 STATE_DIR="$HOME/.cryptic_state"
 LOG_FILE="$LOG_DIR/run.log"
-CONFIG_FILE="$STATE_DIR/config.sh"
 
-mkdir -p "$LOG_DIR" "$APK_DIR" "$TMP_DIR" "$STATE_DIR" "$HOME/bin"
+mkdir -p "$LOG_DIR" "$APK_DIR" "$TMP_DIR" "$STATE_DIR"
 
-BASE_URL_DEFAULT="https://github.com/Fizlyss/cloud-phone/releases/download/er"
-APK_NAMES_DEFAULT=( "Codex.0.apk" "Codex.1.apk" "Codex.2.apk" "Codex.3.apk" "Codex.4.apk" "Codex.5.apk" "Codex.6.apk" "Codex.7.apk" )
-
-# ---------------- color detection ----------------
-if command -v tput >/dev/null 2>&1 && [ "$(tput colors)" -ge 8 ]; then
-  RED="$(tput setaf 1)"; GREEN="$(tput setaf 2)"; YELLOW="$(tput setaf 3)"
-  BLUE="$(tput setaf 4)"; MAGENTA="$(tput setaf 5)"; CYAN="$(tput setaf 6)"
-  BOLD="$(tput bold)"; RESET="$(tput sgr0)"
-else
-  RED=""; GREEN=""; YELLOW=""; BLUE=""; MAGENTA=""; CYAN=""; BOLD=""; RESET=""
-fi
-
-# ---------------- utilities ----------------
+# --------------- Utilities ---------------
 timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-log() { mkdir -p "$LOG_DIR"; printf "[%s] %s\n" "$(timestamp)" "$*" | tee -a "$LOG_FILE"; }
-die() { printf "[%s] FATAL: %s\n" "$(timestamp)" "$*" | tee -a "$LOG_FILE" >&2; exit 1; }
 
-http_fetch_to() {
-  local url="$1" dest="$2" tmp="${dest}.part"
-  rm -f "$tmp"
-  if command -v curl >/dev/null 2>&1; then
-    if curl -fsSL --retry 5 --retry-delay 2 --connect-timeout 20 -o "$tmp" "$url" 2>>"$LOG_FILE"; then
-      mv -f "$tmp" "$dest"; return 0
-    fi
-  else
-    return 1
-  fi
-  rm -f "$tmp"
-  return 1
+log() {
+  mkdir -p "$LOG_DIR"
+  printf "[%s] %s\n" "$(timestamp)" "$*" | tee -a "$LOG_FILE"
 }
 
-pm_install_apk() {
-  local apk="$1"
-  log "Attempting install/update: $apk"
-  if /system/bin/pm install -r -d --user 0 "$apk" >>"$LOG_FILE" 2>&1; then return 0; fi
-  if command -v cmd >/dev/null 2>&1 && cmd package install -r "$apk" >>"$LOG_FILE" 2>&1; then return 0; fi
-  if /system/bin/pm install "$apk" >>"$LOG_FILE" 2>&1; then return 0; fi
-  return 1
+die() {
+  printf "[%s] FATAL: %s\n" "$(timestamp)" "$*" | tee -a "$LOG_FILE" >&2
+  exit 1
+}
+
+http_fetch_to() {
+  # $1 url, $2 dest
+  local url="$1" dest="$2" tmp="${dest}.part"
+  rm -f "$tmp"
+  if curl -fsSL --retry 5 --retry-delay 2 --connect-timeout 20 -o "$tmp" "$url" 2>>"$LOG_FILE"; then
+    mv -f "$tmp" "$dest"
+    return 0
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+ensure_root() {
+  # Optional: re-exec under tsu for root if not root (mirrors original behavior)
+  if [ "$(id -u)" -ne 0 ]; then
+    log "Re-executing under tsu for root privileges..."
+    exec tsu -c "bash -lc '$0 \"$@\"'"
+  fi
 }
 
 ensure_packages() {
+  # try to ensure basic tools are available (non-fatal)
   log "Ensuring basic packages (curl, jq, coreutils)..."
-  if command -v apt >/dev/null 2>&1; then
-    apt update -y >>"$LOG_FILE" 2>&1 || true
-    apt install -y curl coreutils jq busybox procps unzip >>"$LOG_FILE" 2>&1 || true
-  fi
+  apt update -y >>"$LOG_FILE" 2>&1 || true
+  apt install -y curl coreutils jq busybox procps unzip >>"$LOG_FILE" 2>&1 || true
 }
 
 ensure_storage() {
+  # Termux storage permission if possible (no writes to workspace)
   if command -v termux-setup-storage >/dev/null 2>&1; then
+    log "Ensuring Termux storage access (if applicable)..."
     termux-setup-storage >/dev/null 2>&1 || true
   fi
   mkdir -p "$APK_DIR" "$TMP_DIR" "$LOG_DIR"
 }
 
-# ---------------- load / save config ----------------
-load_config() {
-  BASE_URL="$BASE_URL_DEFAULT"
-  APK_NAMES=( "${APK_NAMES_DEFAULT[@]}" )
-  if [ -f "$CONFIG_FILE" ]; then
-    # shellcheck disable=SC1090
-    source "$CONFIG_FILE" || log "Warning: failed to source $CONFIG_FILE"
+pm_install_apk() {
+  local apk="$1"
+  log "Attempting install/update: $apk"
+  # always try reinstall/upgrade first
+  if /system/bin/pm install -r -d --user 0 "$apk" >>"$LOG_FILE" 2>&1; then
+    return 0
   fi
+  # fallback via cmd
+  if command -v cmd >/dev/null 2>&1 && cmd package install -r "$apk" >>"$LOG_FILE" 2>&1; then
+    return 0
+  fi
+  # final fallback
+  if /system/bin/pm install "$apk" >>"$LOG_FILE" 2>&1; then
+    return 0
+  fi
+  return 1
 }
 
-save_config() {
-  mkdir -p "$(dirname "$CONFIG_FILE")"
-  {
-    printf "# One-Shot Clones Downloader config (auto-saved)\n"
-    printf "BASE_URL=%q\n" "$BASE_URL"
-    printf "APK_NAMES=("
-    for n in "${APK_NAMES[@]}"; do printf "%q " "$n"; done
-    printf ")\n"
-  } >"$CONFIG_FILE"
-  log "Saved config to $CONFIG_FILE"
+# JSON sync intentionally omitted / disabled:
+task_json_sync() {
+  log "JSON sync disabled; skipping."
+  return 0
 }
 
-# ---------------- UI & status ----------------
-declare -a STATUS
-init_status() {
-  STATUS=()
-  for i in "${!APK_NAMES[@]}"; do STATUS[$i]="${YELLOW}Pending${RESET}"; done
-}
+# --------------- Tasks (one-shot) ---------------
+task_apk_download_and_install() {
+  log "APK task: starting download and install/update (one-shot)..."
+  mkdir -p "$APK_DIR"
+  local ok_count=0 total=${#APK_NAMES[@]}
 
-AUTO_CLONES_LOGO="
- ${CYAN}${BOLD}   ___  _  _  _  _   _   _   _   _   ____ _ _    ${RESET}
- ${CYAN}${BOLD}  / _ \\| || || || | | | | | | | | | / ___(_) |_  ${RESET}
- ${CYAN}${BOLD} | | | | || || || |_| | | | | | | | \\___ \\ | __| ${RESET}
- ${CYAN}${BOLD} | |_| |__   _|__   _| | |_| |_| |  ___) || |_  ${RESET}
- ${CYAN}${BOLD}  \\___/   |_|    |_|    \\___/\\___/  |____/  \\__| ${RESET}
-"
-
-render_header() {
-  clear
-  printf "%b\n" "$AUTO_CLONES_LOGO"
-  printf " %s%s%s\n\n" "${GREEN}" "Auto download Clones" "${RESET}"
-  printf " %s%s%s\n\n" "${YELLOW}" "v.1 (one-shot mode)" "${RESET}"
-  printf " %s%-30s %s %s\n" "${CYAN}" "Package Operation Status" "${RESET}" ""
-  printf " %s-----------------------------------------------%s\n\n" "${CYAN}" "${RESET}"
-  printf " ${BOLD}%-30s | %-15s${RESET}\n" "Package" "Status"
-  printf " %s-----------------------------------------------%s\n" "${CYAN}" "${RESET}"
-}
-
-render_table() {
-  render_header
-  for idx in "${!APK_NAMES[@]}"; do
-    printf " %-30s | %s\n" "${APK_NAMES[$idx]}" "${STATUS[$idx]}"
+  for name in "${APK_NAMES[@]}"; do
+    local url="$BASE_URL/$name"
+    local dest="$APK_DIR/$name"
+    log "Fetching $name from $url"
+    if http_fetch_to "$url" "$dest"; then
+      log "Downloaded $name -> $dest"
+      if pm_install_apk "$dest"; then
+        log "Installed/Updated $name successfully"
+        rm -f "$dest"
+        log "Deleted $name after install/update"
+        ok_count=$((ok_count+1))
+      else
+        log "WARN: Failed to install/update $name (left at $dest for inspection)"
+      fi
+    else
+      log "WARN: Could not download $name (skipping)"
+      rm -f "$dest"
+    fi
   done
-  printf "\n"
+
+  log "APK task finished: $ok_count/$total installed/updated"
 }
 
-set_status() {
-  local idx="$1" val="$2"
-  STATUS[$idx]="$val"
-  render_table
-}
+# --------------- Main (one-shot) ---------------
+main() {
+  # Uncomment the next line if you want the script to auto-escalate to tsu (original behavior)
+  # ensure_root
 
-# ---------------- read input robustly ----------------
-prompt_tty() {
-  printf "%s" "$1" > /dev/tty
-  IFS= read -r REPLY < /dev/tty || REPLY=""
-}
-
-# ---------------- interactive editor ----------------
-edit_urls() {
-  while true; do
-    clear
-    echo -e "${BOLD}${CYAN}Edit download configuration${RESET}\n"
-    echo -e "Current BASE_URL: ${YELLOW}$BASE_URL${RESET}\n"
-    prompt_tty "Enter new BASE_URL (or press ENTER to keep): "
-    newbase="$REPLY"
-    if [ -n "$newbase" ]; then BASE_URL="$newbase"; log "BASE_URL set to $BASE_URL"; fi
-
-    echo -e "\nCurrent APK list:"
-    for i in "${!APK_NAMES[@]}"; do printf "  [%d] %s\n" "$i" "${APK_NAMES[$i]}"; done
-
-    echo -e "\nActions:"
-    echo "  1) Replace entire list (comma-separated)"
-    echo "  2) Add an APK filename"
-    echo "  3) Remove APK by index"
-    echo "  4) Back to main menu"
-    prompt_tty "Choose action [1-4]: "
-    act="$REPLY"
-    case "$act" in
-      1)
-        prompt_tty "Enter filenames separated by commas (no spaces): "
-        csv="$REPLY"
-        IFS=',' read -r -a newarr <<<"$csv"
-        APK_NAMES=()
-        for v in "${newarr[@]}"; do [ -n "$v" ] && APK_NAMES+=("$v"); done
-        init_status
-        ;;
-      2)
-        prompt_tty "Enter filename to add (e.g. Codex.8.apk): "
-        addn="$REPLY"
-        if [ -n "$addn" ]; then APK_NAMES+=("$addn"); init_status; fi
-        ;;
-      3)
-        prompt_tty "Enter index to remove: "
-        ridx="$REPLY"
-        if printf '%s\n' "$ridx" | grep -qE '^[0-9]+$' && [ -n "${APK_NAMES[$ridx]:-}" ]; then
-          unset 'APK_NAMES[ridx]'
-          APK_NAMES=( "${APK_NAMES[@]}" )
-          init_status
-        else
-          echo -e "${RED}Invalid index${RESET}"; sleep 1
-        fi
-        ;;
-      4)
-        save_config
-        return
-        ;;
-      *)
-        echo -e "${RED}Invalid choice${RESET}"; sleep 1
-        ;;
-    esac
-  done
-}
-
-# ---------------- one-shot task ----------------
-task_one_shot() {
-  log "Starting one-shot APK download & update..."
   ensure_packages
   ensure_storage
 
-  local ok=0 total=${#APK_NAMES[@]}
-  render_table
+  log "codex one-shot orchestrator starting (with update support)."
 
-  local start_ts
-  start_ts=$(date +%s)
-  for idx in "${!APK_NAMES[@]}"; do
-    local name="${APK_NAMES[$idx]}"
-    set_status "$idx" "${YELLOW}Downloading...${RESET}"
-    local url="$BASE_URL/$name" dest="$APK_DIR/$name"
+  # Run APK task once and exit
+  task_apk_download_and_install
 
-    if http_fetch_to "$url" "$dest"; then
-      set_status "$idx" "${CYAN}Downloaded${RESET}"
-      set_status "$idx" "${CYAN}Installing...${RESET}"
-      if pm_install_apk "$dest"; then
-        set_status "$idx" "${GREEN}Installed/Updated${RESET}"
-        rm -f "$dest"
-        ok=$((ok+1))
-      else
-        set_status "$idx" "${RED}Install Failed${RESET}"
-      fi
-    else
-      set_status "$idx" "${RED}Download Failed${RESET}"
-    fi
-
-    local elapsed
-    elapsed=$(( $(date +%s) - start_ts ))
-    printf "\n %sProgress:%s %d/%d    Elapsed: %s sec\n" "${MAGENTA}" "${RESET}" "$ok" "$total" "$elapsed"
-  done
-
-  log "Finished one-shot: $ok/$total installed/updated."
-  prompt_tty "Press ENTER to return to menu... "
-}
-
-# ---------------- menu ----------------
-menu_items=( "[1] One-Shot Mode (download & update)" "[2] Edit download URLs & APK list" "[3] Exit" )
-
-show_menu_and_get_choice() {
-  if command -v fzf >/dev/null 2>&1; then
-    selected=$(printf "%s\n" "${menu_items[@]}" | fzf --ansi --height=8 --border --prompt=" Select: ")
-    if [ -n "$selected" ]; then
-      choice=$(printf "%s" "$selected" | sed -n 's/[^0-9]*\([0-9]\+\).*/\1/p')
-    else
-      choice=""
-    fi
-  else
-    clear
-    render_header
-    for item in "${menu_items[@]}"; do printf "  %b\n" "$item"; done
-    printf "\n"
-    prompt_tty "Select an option [1-3]: "
-    choice="$REPLY"
-  fi
-}
-
-# ---------------- installer ----------------
-do_install() {
-  # Copy myself to ~/bin/oneshot and make executable.
-  mkdir -p "$HOME/bin"
-  cp -f "$SELF_PATH" "$INSTALL_TARGET"
-  chmod +x "$INSTALL_TARGET"
-  # Ensure ~/bin in profile
-  added=0
-  for p in "${PROFILE_FILES[@]}"; do
-    if [ -f "$p" ]; then
-      if ! grep -q 'export PATH=.*$HOME/bin' "$p" 2>/dev/null; then
-        printf '\n# Add user bin to PATH for oneshot\nexport PATH="$HOME/bin:$PATH"\n' >> "$p"
-        added=1
-      fi
-    else
-      # create minimal profile
-      printf 'export PATH="$HOME/bin:$PATH"\n' > "$p"
-      added=1
-    fi
-  done
-  echo
-  echo "Installed to: $INSTALL_TARGET"
-  if [ "$added" -eq 1 ]; then
-    echo "Added ~/bin to your profile files. Reload your shell or run: source ~/.profile"
-  fi
-  echo "You can now run: oneshot"
-}
-
-# ---------------- main ----------------
-load_config
-init_status
-
-# If user asked to install, do it and exit
-if [ "${1:-}" = "--install" ] || [ "${1:-}" = "install" ]; then
-  do_install
+  log "One-shot orchestrator finished. Exiting."
   exit 0
-fi
+}
 
-# Normal interactive run
-while true; do
-  show_menu_and_get_choice
-  case "$choice" in
-    1) task_one_shot ;;
-    2) edit_urls ;;
-    3) echo -e "${CYAN}Exiting. Goodbye!${RESET}"; exit 0 ;;
-    *) echo -e "${RED}Invalid choice. Try again.${RESET}"; sleep 1 ;;
-  esac
-done
+main "$@"
+
