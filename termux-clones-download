@@ -1,8 +1,7 @@
-
 #!/usr/bin/env bash
-# One-shot Cryptic Termux Orchestrator (original-style, no loop, no GoFile)
-# - Downloads Codex.0..Codex.8 from GitHub releases
-# - Attempts to install each APK, deletes on success
+# One-shot Cryptic Termux Orchestrator (with update support)
+# - Downloads Codex.0..Codex.7 from GitHub releases
+# - Installs or updates each APK, deletes on success
 # - Does NOT install Termux:Boot, does NOT loop, does NOT modify workspace JSON
 set -eo pipefail
 
@@ -75,8 +74,8 @@ ensure_storage() {
 
 pm_install_apk() {
   local apk="$1"
-  log "Attempting install: $apk"
-  # try pm with typical flags
+  log "Attempting install/update: $apk"
+  # always try reinstall/upgrade first
   if /system/bin/pm install -r -d --user 0 "$apk" >>"$LOG_FILE" 2>&1; then
     return 0
   fi
@@ -99,7 +98,7 @@ task_json_sync() {
 
 # --------------- Tasks (one-shot) ---------------
 task_apk_download_and_install() {
-  log "APK task: starting download and install (one-shot)..."
+  log "APK task: starting download and install/update (one-shot)..."
   mkdir -p "$APK_DIR"
   local ok_count=0 total=${#APK_NAMES[@]}
 
@@ -110,12 +109,12 @@ task_apk_download_and_install() {
     if http_fetch_to "$url" "$dest"; then
       log "Downloaded $name -> $dest"
       if pm_install_apk "$dest"; then
-        log "Installed $name successfully"
+        log "Installed/Updated $name successfully"
         rm -f "$dest"
-        log "Deleted $name after install"
+        log "Deleted $name after install/update"
         ok_count=$((ok_count+1))
       else
-        log "WARN: Failed to install $name (left at $dest for inspection)"
+        log "WARN: Failed to install/update $name (left at $dest for inspection)"
       fi
     else
       log "WARN: Could not download $name (skipping)"
@@ -123,7 +122,7 @@ task_apk_download_and_install() {
     fi
   done
 
-  log "APK task finished: $ok_count/$total installed"
+  log "APK task finished: $ok_count/$total installed/updated"
 }
 
 # --------------- Main (one-shot) ---------------
@@ -134,7 +133,7 @@ main() {
   ensure_packages
   ensure_storage
 
-  log "codex one-shot orchestrator starting (derived from original)."
+  log "codex one-shot orchestrator starting (with update support)."
 
   # Run APK task once and exit
   task_apk_download_and_install
@@ -144,3 +143,4 @@ main() {
 }
 
 main "$@"
+
