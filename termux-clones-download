@@ -1,8 +1,28 @@
 #!/usr/bin/env bash
-# One-Shot Clones Downloader — Fixed interactive menu (reads from /dev/tty) + URL editor
+# One-Shot Clones Downloader — Fixed: detect sourcing, force bash, robust menu input
 set -eo pipefail
 
-# Ensure we are running under bash (re-exec under bash if not)
+# ------------- Prevent being sourced -------------
+# If the script is sourced ('. script' or 'source script'), $BASH_SOURCE[0] != $0.
+# In that case, give a friendly message and stop, because interactive menus don't work correctly when sourced.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  cat <<'MSG'
+It looks like you sourced this script (used '.' or 'source').
+Please run it instead of sourcing it:
+
+  chmod +x downloader.sh
+  ./downloader.sh
+  # or
+  bash downloader.sh
+
+Sourcing runs the file in your current shell and breaks interactive prompts.
+MSG
+  # stop without leaving the caller shell in a bad state
+  return 0 2>/dev/null || exit 0
+fi
+
+# ------------- Ensure we're running under bash -------------
+# If we are not bash (e.g. invoked with 'sh script'), re-exec using bash.
 if [ -z "$BASH" ] || [ -z "$BASH_VERSION" ]; then
   exec bash "$0" "$@"
 fi
