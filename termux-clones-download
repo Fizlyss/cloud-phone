@@ -1,299 +1,665 @@
 #!/usr/bin/env bash
+# Vernix Manager - Cleaned (no logs, clearer menus, auto-delete APKs after install, colored prompts/tags)
 set -euo pipefail
 
-# Configuration
-BASE_URL="https://github.com/Fizlyss/cloud-phone/releases/download/er"
-APK_NAMES=( "test" "e13123131" "Codex.0.apk" "Codex.1.apk" "Codex.2.apk" "Codex.3.apk" "Codex.4.apk" "Codex.5.apk" "Codex.6.apk" "Codex.7.apk")
-APK_DIR="$HOME/apks"
-LOG_DIR="$HOME/.local/share/executor_clones_download"
-mkdir -p "$APK_DIR" "$LOG_DIR"
-LOG_FILE="$LOG_DIR/installation-$(date +%Y%m%d-%H%M%S).log"
+# Paths
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vernix_manager"
+SAVED_URLS_FILE="$CONFIG_DIR/saved_urls.cfg"
+APK_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/vernix_manager/apks"
+mkdir -p "$CONFIG_DIR" "$APK_DIR"
 
-# Globals
-declare -gA STATUS
-declare -gA PROGRESS
-declare -gA APK_FULL_URLS   # filename -> full URL mapping (populated when listing a release)
+# Ensure saved-urls file exists
+if [[ ! -f "$SAVED_URLS_FILE" ]]; then
+  printf "# Vernix saved URLs\n# Lines starting with # are comments\n" > "$SAVED_URLS_FILE"
+  chmod 600 "$SAVED_URLS_FILE" 2>/dev/null || true
+fi
 
 # Colors
-RED="\033[1;31m"; GREEN="\033[1;32m"; YELLOW="\033[1;33m"
-BLUE="\033[1;34m"; CYAN="\033[1;36m"; ORANGE="\033[1;38;5;208m"
-BOLD="\033[1m"; DIM="\033[2m"; RESET="\033[0m"
+C_RESET="\033[0m"
+C_BOLD="\033[1m"
+C_DIM="\033[2m"
+C_BLUE="\033[1;34m"     # info / [Deleting]
+C_CYAN="\033[1;36m"
+C_GREEN="\033[1;32m"    # success
+C_YELLOW="\033[1;33m"   # warn (orange-ish)
+C_RED="\033[1;31m"      # errors
+C_MAGENTA="\033[1;35m"
+LINE="--------------------------------------------------"
 
-# Helpers
-log() {
-    echo "[$(date +"%F %T")] $1" >> "$LOG_FILE"
-    echo -e "$1"
+clear_screen(){ command -v clear >/dev/null 2>&1 && clear || printf '\n\n'; }
+
+print_banner(){
+  echo -e "${C_CYAN}"
+  echo -e "██╗░░░██╗███████╗██████╗░███╗░░██╗██╗██╗░░██╗"
+  echo -e "██║░░░██║██╔════╝██╔══██╗████╗░██║██║╚██╗██╔╝"
+  echo -e "╚██╗░██╔╝█████╗░░██████╔╝██╔██╗██║██║░╚███╔╝░"
+  echo -e "░╚████╔╝░██╔══╝░░██╔══██╗██║╚████║██║░██╔██╗░"
+  echo -e "░░╚██╔╝░░███████╗██║░░██║██║░╚███║██║██╔╝╚██╗"
+  echo -e "░░░╚═╝░░░╚══════╝╚═╝░░╚═╝╚═╝░░╚══╝╚═╝╚═╝░░╚═╝"
+  echo -e "${C_RESET}"
+  echo -e "${C_BOLD}${C_BLUE}Vernix Manager${C_RESET}\n"
 }
-clear_screen() { command -v clear >/dev/null 2>&1 && clear || true; }
 
-# Safe exit: if script is sourced, return; otherwise exit
-safe_exit() {
-    if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
-        return 0
-    else
-        exit 0
+# Console output helpers (no file logging)
+info(){ echo -e "${C_BLUE}[INFO]${C_RESET} $*"; }
+warn(){ echo -e "${C_YELLOW}[WARN]${C_RESET} $*"; }
+err(){  echo -e "${C_RED}[ERROR]${C_RESET} $*"; }
+ok(){   echo -e "${C_GREEN}[OK]${C_RESET} $*"; }
+success(){ echo -e "${C_GREEN}[Success]${C_RESET} $*"; }      # green success tag
+deleting(){ echo -e "${C_BLUE}[Deleting]${C_RESET} $*"; }     # blue deleting tag
+
+trim(){ local v="$*"; v="${v#${v%%[![:space:]]*}}"; v="${v%${v##*[![:space:]]}}"; printf '%s' "$v"; }
+
+# Confirm helper: yes/YES/y/Y/yes -> 0; default NO
+confirm(){
+  local prompt="$1" ans
+  read -r -p "$prompt [y/N]: " ans
+  ans="$(trim "${ans,,}")"
+  [[ "$ans" == "y" || "$ans" == "yes" ]]
+}
+
+# sanitize menu names for "go back to" labels
+sanitize_name(){ local s="$*"; s="${s//_/ }"; s="${s#${s%%[![:space:]]*}}"; s="${s%${s##*[![:space:]]}}"; [[ -z "$s" ]] && printf '%s' "previous menu" || printf '%s' "$s"; }
+back_label(){ local name; name="$(sanitize_name "$1")"; printf "%s" "${C_BLUE}0.${C_RESET} Go back to ${name}"; }
+
+# Saved URLs loader (consistent and removes ".6")
+load_saved_urls(){
+  touch "$SAVED_URLS_FILE"
+  SAVED_URLS=()
+  declare -A _seen
+  if [[ -f "$SAVED_URLS_FILE" ]]; then
+    mapfile -t _tmp < "$SAVED_URLS_FILE"
+  else
+    _tmp=()
+  fi
+  for line in "${_tmp[@]}"; do
+    line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [[ -z "$line" ]] && continue
+    [[ "${line:0:1}" == "#" ]] && continue
+    [[ "$line" == ".6" ]] && continue
+    if [[ -z "${_seen[$line]:-}" ]]; then SAVED_URLS+=("$line"); _seen[$line]=1; fi
+  done
+}
+
+save_url(){
+  local url; url="$(trim "$1")"
+  [[ -z "$url" ]] && { warn "No url entered."; return 1; }
+  touch "$SAVED_URLS_FILE"
+  [[ "$url" == ".6" ]] && { err "Invalid url: .6"; return 1; }
+  if grep -Fxq "$url" "$SAVED_URLS_FILE" 2>/dev/null; then warn "url already saved."; return 0; fi
+  echo "$url" >> "$SAVED_URLS_FILE"
+  ok "url saved."
+  load_saved_urls
+  return 0
+}
+
+clear_all_urls(){
+  : > "$SAVED_URLS_FILE"
+  load_saved_urls
+  success "All saved url(s) deleted."
+}
+
+# parse comma/range selection like 1,2,4 or 1-3
+parse_index_selection(){
+  local s="$1"; selected_indices=(); IFS=',' read -r -a parts <<< "$s"
+  for p in "${parts[@]}"; do p="$(trim "$p")"; [[ -z "$p" ]] && continue
+    if [[ "$p" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}
+      if (( a <= b )); then for ((k=a;k<=b;k++)); do selected_indices+=("$k"); done
+      else for ((k=a;k>=b;k--)); do selected_indices+=("$k"); done; fi
+    elif [[ "$p" =~ ^[0-9]+$ ]]; then selected_indices+=("$p")
+    else return 1
     fi
+  done
+  return 0
 }
 
-print_banner() {
-    echo -e "${CYAN}"
-    echo -e "██╗░░░██╗███████╗██████╗░███╗░░██╗██╗██╗░░██╗"
-    echo -e "██║░░░██║██╔════╝██╔══██╗████╗░██║██║╚██╗██╔╝"
-    echo -e "╚██╗░██╔╝█████╗░░██████╔╝██╔██╗██║██║░╚███╔╝░"
-    echo -e "░╚████╔╝░██╔══╝░░██╔══██╗██║╚████║██║░██╔██╗░"
-    echo -e "░░╚██╔╝░░███████╗██║░░██║██║░╚███║██║██╔╝╚██╗"
-    echo -e "░░░╚═╝░░░╚══════╝╚═╝░░╚═╝╚═╝░░╚══╝╚═╝╚═╝░░╚═╝"
-    echo -e "${RESET}"
-    echo -e "${BOLD}${BLUE}Auto roblox clones installer/updater (made by _fizly_)${RESET}\n"
+# GitHub discovery (API -> HTML -> fallback)
+CURL_UA='Mozilla/5.0'
+parse_github_url_components(){
+  local url="$1"; GH_OWNER=""; GH_REPO=""; GH_TAG=""
+  if [[ "$url" =~ github\.com/([^/]+)/([^/]+)/releases/tag/([^/]+) ]]; then GH_OWNER="${BASH_REMATCH[1]}"; GH_REPO="${BASH_REMATCH[2]}"; GH_TAG="${BASH_REMATCH[3]}"; return 0
+  elif [[ "$url" =~ github\.com/([^/]+)/([^/]+)/releases/latest ]]; then GH_OWNER="${BASH_REMATCH[1]}"; GH_REPO="${BASH_REMATCH[2]}"; GH_TAG="latest"; return 0
+  elif [[ "$url" =~ github\.com/([^/]+)/([^/]+)/releases/?$ ]]; then GH_OWNER="${BASH_REMATCH[1]}"; GH_REPO="${BASH_REMATCH[2]}"; GH_TAG=""; return 0; fi
+  return 1
 }
 
-print_status_table() {
-    local i=1 file stat prog color
-    echo -e "${BOLD}${BLUE}PROGRESS STATUS:${RESET}"
-    echo -e "┌───────┬──────────────────────┬───────────────┬──────────────┐"
-    echo -e "│ ${BOLD}#${RESET}             │ ${BOLD}APK File${RESET}      │  ${BOLD}Status${RESET}       │ ${BOLD}Progress${RESET}    │"
-    echo -e "├───────┼──────────────────────┼───────────────┼──────────────┤"
-    for file in "${!STATUS[@]}"; do
-        stat="${STATUS[$file]}"
-        prog="${PROGRESS[$file]:-0%}"
-        color="$RESET"
-        case "$stat" in
-            "PENDING") color="$DIM" ;;
-            "DOWNLOADING") color="$YELLOW" ;;
-            "DOWNLOADED") color="$BLUE" ;;
-            "INSTALLING") color="$YELLOW" ;;
-            "INSTALLED") color="$GREEN" ;;
-            "FAILED") color="$RED" ;;
-        esac
-        printf "│ [%d]  │ %-20s │ ${color}%-11s${RESET} │ %-10s  │\n" "$i" "$file" "$stat" "$prog"
-        i=$((i+1))
+# global arrays set by this function: assets_names, assets_urls
+fetch_assets_for_release(){
+  local url="$1"; assets_names=(); assets_urls=()
+  local api json html raw base seen full name
+  if parse_github_url_components "$url"; then
+    if [[ "$GH_TAG" == "latest" ]]; then api="https://api.github.com/repos/$GH_OWNER/$GH_REPO/releases/latest"
+    elif [[ -n "$GH_TAG" ]]; then api="https://api.github.com/repos/$GH_OWNER/$GH_REPO/releases/tags/$GH_TAG"
+    else api="https://api.github.com/repos/$GH_OWNER/$GH_REPO/releases"; fi
+    info "Fetching release assets via GitHub API…"
+    if json="$(curl -sfL -A "$CURL_UA" -H "Accept: application/vnd.github.v3+json" "$api" 2>/dev/null)"; then
+      if command -v jq >/dev/null 2>&1; then
+        if echo "$json" | jq -e 'type=="array"' >/dev/null 2>&1; then json="$(echo "$json" | jq -r '.[0]')"; fi
+        mapfile -t assets_names < <(echo "$json" | jq -r '.assets[]?.name' 2>/dev/null || true)
+        mapfile -t assets_urls  < <(echo "$json" | jq -r '.assets[]?.browser_download_url' 2>/dev/null || true)
+        [[ ${#assets_urls[@]} -gt 0 ]] && { info "Assets found via API."; return 0; }
+      else
+        mapfile -t assets_urls < <(echo "$json" | grep -oP '"browser_download_url":\s*"\Khttps?://[^"]+' || true)
+        mapfile -t assets_names < <(echo "$json" | grep -oP '"name":\s*"\K[^"]+' || true)
+        [[ ${#assets_urls[@]} -gt 0 ]] && { info "Assets found via API."; return 0; }
+      fi
+    fi
+  fi
+  info "Falling back to HTML scraping…"
+  if html="$(curl -sfL -A "$CURL_UA" "$url" 2>/dev/null)"; then
+    mapfile -t raw < <(printf '%s' "$html" | grep -oP 'href="[^"]*/releases/download/[^"]+"' | sed -E 's/href="([^"]+)"/\1/' || true)
+    [[ ${#raw[@]} -eq 0 ]] && mapfile -t raw < <(printf '%s' "$html" | grep -oP '"browser_download_url":\s*"\Khttps?://[^\"]+' || true)
+    [[ ${#raw[@]} -eq 0 ]] && mapfile -t raw < <(printf '%s' "$html" | grep -oP '/[^\"]*/releases/download/[^" >]+' || true)
+    declare -A seen
+    base="${url%/}"
+    for p in "${raw[@]}"; do
+      p="$(trim "$p")"
+      if [[ "$p" =~ ^// ]]; then full="https:$p"
+      elif [[ "$p" =~ ^/ ]]; then full="https://github.com$p"
+      elif [[ "$p" =~ ^https?:// ]]; then full="$p"
+      else full="$base/$p"; fi
+      name="$(basename "${full%%\?*}")"
+      if [[ -z "${seen[$name]:-}" ]]; then assets_names+=("$name"); assets_urls+=("$full"); seen[$name]=1; fi
     done
-    echo -e "└───────┴──────────────────────┴──────────────┴──────────────┘\n"
+    [[ ${#assets_urls[@]} -gt 0 ]] && { info "Assets found via HTML."; return 0; }
+  fi
+  if curl -sfL -A "$CURL_UA" "$url" 2>/dev/null | grep -qiE 'releases/tag|class="release"|aria-label="Release"|>Release<'; then
+    warn "Release found but couldn't parse assets — using default .apk names"
+    assets_names=("executor.0.apk" "executor.1.apk" "executor.2.apk")
+    assets_urls=()
+    for n in "${assets_names[@]}"; do assets_urls+=("${url%/}/$n"); done
+    return 0
+  fi
+  err "No assets found for $url"
+  return 1
 }
 
-download_apk() {
-    local url="$1"; local dest="$2"; local apk_name="$3"
-    STATUS["$apk_name"]="DOWNLOADING"
-    PROGRESS["$apk_name"]="0%"
-    clear_screen && print_banner && print_status_table
-    log "${CYAN}[INFO] Downloading $apk_name from $url"
+# Progress table and download/install functions
+declare -A STATUS
+declare -A PROGRESS
+declare -A APK_FULL_URLS  # global mapping: filename -> url
 
-    if curl -fL -A "Mozilla/5.0 (X11; Linux x86_64)" --retry 3 -o "$dest.part" "$url" --progress-bar; then
-        mv "$dest.part" "$dest"
-        STATUS["$apk_name"]="DOWNLOADED"
-        PROGRESS["$apk_name"]="100%"
-        log "${GREEN}[SUCCESS] Downloaded $apk_name"
-        return 0
-    else
-        STATUS["$apk_name"]="FAILED"
-        log "${RED}[ERROR] Failed to download $apk_name from $url"
-        [[ -f "$dest.part" ]] && rm -f "$dest.part"
-        return 1
-    fi
+build_bar(){
+  local pct=$1 width=${2:-30}
+  local filled=$(( pct * width / 100 ))
+  local empty=$(( width - filled ))
+  local bar=""
+  (( filled > 0 )) && bar="$(printf '#%.0s' $(seq 1 $filled))"
+  (( empty > 0 )) && bar+="$(printf '.%.0s' $(seq 1 $empty))"
+  printf "[%s] %3d%%" "$bar" "$pct"
 }
 
-install_apk() {
-    local apk_path="$1"; local apk_name="$2"
-    STATUS["$apk_name"]="INSTALLING"
-    clear_screen && print_banner && print_status_table
-    log "${YELLOW}[INSTALL] Installing/Updating $apk_name"
-
-    if [[ "${apk_name,,}" != *.apk ]]; then
-        log "${YELLOW}[SKIP] $apk_name is not an .apk file; download only.${RESET}"
-        STATUS["$apk_name"]="DOWNLOADED"
-        return 0
-    fi
-
-    if command -v pm >/dev/null 2>&1 && pm install -r -d "$apk_path" >> "$LOG_FILE" 2>&1; then
-        STATUS["$apk_name"]="INSTALLED"
-        log "${GREEN}[SUCCESS] Installed/Updated $apk_name"
-        return 0
-    else
-        if command -v aapt >/dev/null 2>&1; then
-            local pkg_name
-            pkg_name=$(aapt dump badging "$apk_path" 2>/dev/null | awk -v FS="'" '/package: name=/{print $2}')
-            if [[ -n "$pkg_name" ]]; then
-                pm uninstall "$pkg_name" >> "$LOG_FILE" 2>&1 || true
-                if pm install -d "$apk_path" >> "$LOG_FILE" 2>&1; then
-                    STATUS["$apk_name"]="INSTALLED"
-                    log "${GREEN}[SUCCESS] Forced reinstall of $apk_name"
-                    return 0
-                fi
-            fi
-        fi
-        STATUS["$apk_name"]="FAILED"
-        log "${RED}[ERROR] Failed to install $apk_name (pm not available or install failed). Check device logs."
-        return 1
-    fi
-}
-
-download_and_install_apks() {
-    local -n apks_to_process=$1
-    local ok=0 total=${#apks_to_process[@]}
-
-    declare -gA STATUS=()
-    declare -gA PROGRESS=()
-    for apk in "${apks_to_process[@]}"; do
-        STATUS["$apk"]="PENDING"
-        PROGRESS["$apk"]="0%"
-    done
-
-    for apk_file in "${apks_to_process[@]}"; do
-        local url
-        if [[ -n "${APK_FULL_URLS[$apk_file]:-}" ]]; then
-            url="${APK_FULL_URLS[$apk_file]}"
-        else
-            url="${BASE_URL%/}/$apk_file"
-        fi
-        local dest="$APK_DIR/$apk_file"
-        if download_apk "$url" "$dest" "$apk_file"; then
-            install_apk "$dest" "$apk_file" && ok=$((ok+1))
-        fi
-        clear_screen && print_banner && print_status_table
-        sleep 1
-    done
-
-    echo -e "${BOLD}${BLUE}SUMMARY:${RESET} ${GREEN}$ok succeeded${RESET}, ${RED}$((total-ok)) failed${RESET}"
-    echo -e "${DIM}Logs saved at $LOG_FILE${RESET}"
-}
-
-auto_download_install() {
-    log "${BLUE}[OPTION 1] Auto downloading and installing/updating all predefined clones."
-    local temp_apk_names=("${APK_NAMES[@]}")
-    download_and_install_apks temp_apk_names
-}
-
-# -----------------------------
-# FIXED: Option 2 uses GitHub API instead of scraping HTML
-# -----------------------------
-change_url_and_select_download() {
-    log "${BLUE}[OPTION 2] Change URL and list assets from the release page."
-    echo -e "${YELLOW}Current Base URL for downloads: ${BASE_URL}${RESET}"
-    read -r -p "Enter GitHub release TAG URL (e.g. https://github.com/Owner/Repo/releases/tag/v1.0): " NEW_RELEASE_TAG_URL
-    NEW_RELEASE_TAG_URL=$(echo "$NEW_RELEASE_TAG_URL" | xargs)
-
-    if [[ -z "$NEW_RELEASE_TAG_URL" ]]; then
-        log "${YELLOW}No URL entered. Using existing list.${RESET}"
-        return 0
-    fi
-
-    # Parse Owner/Repo/Tag from URL
-    if [[ "$NEW_RELEASE_TAG_URL" =~ github\.com/([^/]+)/([^/]+)/releases/tag/([^/]+) ]]; then
-        owner="${BASH_REMATCH[1]}"
-        repo="${BASH_REMATCH[2]}"
-        tag="${BASH_REMATCH[3]}"
-    else
-        log "${RED}[ERROR] Could not parse GitHub release URL. Must look like: https://github.com/Owner/Repo/releases/tag/v1.0${RESET}"
-        return 1
-    fi
-
-    api_url="https://api.github.com/repos/$owner/$repo/releases/tags/$tag"
-    log "${CYAN}[INFO] Fetching release assets from: $api_url${RESET}"
-    json="$(curl -sfL -H "Accept: application/vnd.github.v3+json" "$api_url")" || {
-        log "${CYAN}[ERROR] Failed to fetch release JSON from GitHub API${RESET}"
-        return 1
-    }
-
-    mapfile -t asset_urls < <(echo "$json" | grep -oP '"browser_download_url":\s*"\Khttps?://[^"]+')
-    mapfile -t asset_names < <(echo "$json" | grep -oP '"name":\s*"\K[^"]+')
-
-    if [[ ${#asset_urls[@]} -eq 0 ]]; then
-        log "${CYAN}[ERROR] No assets found in release.${RESET}"
-        return 1
-    fi
-
-    APK_FULL_URLS=()
-    local apks_list=()
-    for i in "${!asset_urls[@]}"; do
-        fname="${asset_names[$i]}"
-        url="${asset_urls[$i]}"
-        APK_FULL_URLS["$fname"]="$url"
-        apks_list+=("$fname")
-    done
-
-    echo -e "\n${BOLD}Available assets found:${RESET}"
-    local idx=1
-    for fname in "${apks_list[@]}"; do
-        echo "  [$idx] $fname"
-        idx=$((idx+1))
-    done
-
-    echo -e "\nSelect how to pick assets:"
-    echo "  1) Manually select by numbers (e.g., 1 3 4)"
-    echo "  2) Select by name or comma-separated patterns (e.g., Codex, Codex.5)"
-    read -r -p "Choice (1 or 2): " sel_choice
-    sel_choice=$(echo "$sel_choice" | xargs)
-
-    local selected_apks=()
-    case "$sel_choice" in
-        1)
-            read -r -p "Enter numbers separated by spaces: " nums
-            for n in $nums; do
-                if [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#apks_list[@]} )); then
-                    selected_apks+=("${apks_list[$((n-1))]}")
-                else
-                    log "${CYAN}Skipping invalid selection: $n${RESET}"
-                fi
-            done
-            ;;
-        2)
-            read -r -p "Enter comma-separated names/patterns: " pattern_input
-            IFS=',' read -ra patterns <<< "$pattern_input"
-            for p in "${patterns[@]}"; do
-                p="$(echo "$p" | xargs)"
-                for fname in "${apks_list[@]}"; do
-                    if [[ "$fname" == *"$p"* ]]; then
-                        selected_apks+=("$fname")
-                    fi
-                done
-            done
-            ;;
-        *)
-            log "${CYAN}Invalid selection mode. Returning to menu.${RESET}"
-            return 1
-            ;;
+print_status_table(){
+  clear_screen; print_banner
+  echo -e "${C_BOLD} APK STATUS ${C_RESET}"
+  printf "%4s %-40s %-20s %-10s\n" "#" "APK FILE" "STATUS" "PROGRESS"
+  printf "%s\n" "-------------------------------------------------------------------------------"
+  local i=1
+  for file in "${!STATUS[@]}"; do
+    local stat="${STATUS[$file]}" prog="${PROGRESS[$file]:-0%}" color="${C_RESET}"
+    case "$stat" in
+      PENDING) color="${C_DIM}" ;;
+      DOWNLOADING) color="${C_CYAN}" ;;
+      DOWNLOADED) color="${C_BLUE}" ;;
+      INSTALLING) color="${C_YELLOW}" ;;
+      INSTALLED) color="${C_GREEN}" ;;
+      FAILED) color="${C_RED}" ;;
+      SKIPPED) color="${C_MAGENTA}" ;;
+      OPENING) color="${C_YELLOW}" ;;
     esac
+    printf "%4s ${C_BOLD}%-40s${C_RESET} ${color}%-20s${C_RESET} ${C_DIM}%-10s${C_RESET}\n" "[$i]" "$file" "$stat" "$prog"
+    i=$((i+1))
+  done
+  printf "%s\n\n" "-------------------------------------------------------------------------------"
+}
 
-    if [[ ${#selected_apks[@]} -eq 0 ]]; then
-        log "${CYAN}No assets selected. Returning to main menu.${RESET}"
-        return 0
+timer_start(){ T_START=$(date +%s); }
+timer_end(){ local elapsed=$(( $(date +%s) - T_START )); info "Time elapsed: ${elapsed}s"; }
+
+download_asset(){
+  local url="$1" dest="$2" name="$3"
+  STATUS["$name"]="DOWNLOADING"; PROGRESS["$name"]="0%"; print_status_table
+  timer_start
+  local cl=$(curl -sI -L -A "$CURL_UA" "$url" 2>/dev/null | tr -d '\r' | awk '/[Cc]ontent-[Ll]ength:/ {print $2}' | tail -n1 || true)
+  cl="${cl:-0}"
+  [[ -f "$dest.part" ]] && rm -f "$dest.part"
+  if [[ "$cl" =~ ^[0-9]+$ && "$cl" -gt 0 ]]; then
+    curl -fL -A "$CURL_UA" --retry 3 -o "$dest.part" "$url" >/dev/null 2>&1 &
+    local pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+      local bytes=0; [[ -f "$dest.part" ]] && bytes=$(stat -c%s "$dest.part" 2>/dev/null || echo 0)
+      local pct=$(( bytes * 100 / cl )); (( pct>100 )) && pct=100
+      PROGRESS["$name"]="$(build_bar "$pct" 30)"; print_status_table
+      sleep 0.4
+    done
+    if ! wait "$pid"; then STATUS["$name"]="FAILED"; PROGRESS["$name"]="0%"; err "curl failed for $name"; return 1; fi
+    mv "$dest.part" "$dest"
+    STATUS["$name"]="DOWNLOADED"; PROGRESS["$name"]="$(build_bar 100 30)"; timer_end
+    ok "Downloaded $name"
+    return 0
+  else
+    curl -fL -A "$CURL_UA" --retry 3 -o "$dest.part" "$url" >/dev/null 2>&1 &
+    local pid=$!
+    local spinner=( '|' '/' '-' '\\' ); local s=0
+    while kill -0 "$pid" 2>/dev/null; do
+      local bytes=0; [[ -f "$dest.part" ]] && bytes=$(stat -c%s "$dest.part" 2>/dev/null || echo 0)
+      local mb=$(( bytes / 1024 / 1024 ))
+      PROGRESS["$name"]="Downloading ${mb}MB ${spinner[s]}"; print_status_table
+      s=$(( (s+1) % 4 )); sleep 0.5
+    done
+    if ! wait "$pid"; then STATUS["$name"]="FAILED"; PROGRESS["$name"]="0%"; err "curl failed for $name"; return 1; fi
+    mv "$dest.part" "$dest"
+    STATUS["$name"]="DOWNLOADED"; PROGRESS["$name"]="$(build_bar 100 30)"; timer_end
+    ok "Downloaded $name"
+    return 0
+  fi
+}
+
+install_apk(){
+  local path="$1" name="$2" mode="$3"
+  STATUS["$name"]="INSTALLING"; PROGRESS["$name"]="0%"; print_status_table
+
+  # --- Prefer silent root install ---
+  if command -v su >/dev/null 2>&1 && su -c "command -v pm" >/dev/null 2>&1; then
+    local pm_args=""
+    [[ "$mode" == "install_update" ]] && pm_args="-r -d"
+    if [[ "$mode" == "force" ]]; then
+      if command -v aapt >/dev/null 2>&1; then
+        pkg=$(aapt dump badging "$path" 2>/dev/null | awk -F"'" '/package: name=/{print $2}' || true)
+        [[ -n "$pkg" ]] && su -c "pm uninstall $pkg" >/dev/null 2>&1 || true
+      fi
+      pm_args="-d"
     fi
 
-    log "${BLUE}Proceeding to download ${#selected_apks[@]} asset(s) ...${RESET}"
-    download_and_install_apks selected_apks
+    ( su -c "pm install $pm_args \"$path\"" >/dev/null 2>&1 ) &
+    pid=$!
+    if wait "$pid"; then
+      STATUS["$name"]="INSTALLED"; PROGRESS["$name"]="$(build_bar 100 30)"
+      success "$name installed (root). Removing downloaded apk…"
+      rm -f "$path" || true
+      return 0
+    else
+      STATUS["$name"]="FAILED"; warn "$name failed to install"
+      return 1
+    fi
+  fi
+
+  # --- Non-root pm method ---
+  if command -v pm >/dev/null 2>&1; then
+    local pm_args=""
+    [[ "$mode" == "install_update" ]] && pm_args="-r -d"
+    if [[ "$mode" == "force" ]]; then
+      if command -v aapt >/dev/null 2>&1; then
+        pkg=$(aapt dump badging "$path" 2>/dev/null | awk -F"'" '/package: name=/{print $2}' || true)
+        [[ -n "$pkg" ]] && pm uninstall "$pkg" >/dev/null 2>&1 || true
+      fi
+      pm_args="-d"
+    fi
+
+    ( pm install $pm_args "$path" >/dev/null 2>&1 ) &
+    pid=$!
+    if wait "$pid"; then
+      STATUS["$name"]="INSTALLED"; PROGRESS["$name"]="$(build_bar 100 30)"
+      success "$name installed. Removing downloaded apk…"
+      rm -f "$path" || true
+      return 0
+    else
+      STATUS["$name"]="FAILED"; warn "$name failed to install"
+      return 1
+    fi
+  fi
+
+  # --- Fallback: manual installer ---
+  if command -v termux-open >/dev/null 2>&1; then
+    STATUS["$name"]="OPENING"; PROGRESS["$name"]="Opening…"; print_status_table
+    termux-open "$path"
+    STATUS["$name"]="INSTALLED"; PROGRESS["$name"]="$(build_bar 100 30)"
+    warn "$name opened for manual install (apk kept)"
+    return 0
+  fi
+
+  STATUS["$name"]="SKIPPED"
+  warn "$name downloaded but not installed (no installer found)"
+  return 0
 }
 
-main_menu() {
-    while true; do
-        clear_screen
-        print_banner
-        echo -e "${BOLD}Choose an option:${RESET}"
-        echo -e "  1) ${CYAN}Start auto download/install/update all roblox clones${RESET}"
-        echo -e "  2) ${CYAN}Change URL (list assets from release) and  download/install/update roblox clones${RESET}"
-        echo -e "  3) ${CYAN}Exit${RESET}"
-        read -r -p "Enter your choice: " choice
-        choice=$(echo "$choice" | xargs)
-
-        case "$choice" in
-            1)
-                auto_download_install
-                read -r -p "Press Enter to return to menu..."
-                ;;
-            2)
-                change_url_and_select_download
-                read -r -p "Press Enter to return to menu..."
-                ;;
-            3)
-                log "${BLUE}Exiting script. Goodbye!${RESET}"
-                echo -e "${BOLD}${BLUE}Exiting. Goodbye!${RESET}"
-                safe_exit
-                ;;
-            *)
-                log "${RED}Invalid choice: $choice. Please try again.${RESET}"
-                sleep 1
-                ;;
-        esac
-    done
+# process selected assets (download/install)
+run_selected_assets(){
+  local -n assets=$1; local mode="$2"
+  declare -gA STATUS=(); declare -gA PROGRESS=()
+  if [[ ${#assets[@]} -eq 0 ]]; then warn "No assets selected"; return 0; fi
+  info "Processing ${#assets[@]} assets (mode: $mode)"
+  for a in "${assets[@]}"; do STATUS["$a"]="PENDING"; PROGRESS["$a"]="0%"; done
+  print_status_table
+  local succ=0 fail=0
+  for a in "${assets[@]}"; do
+    local url="${APK_FULL_URLS[$a]:-}"
+    if [[ -z "$url" ]]; then warn "No url for $a; skipping"; STATUS["$a"]="SKIPPED"; fail=$((fail+1)); continue; fi
+    if download_asset "$url" "$APK_DIR/$a" "$a"; then
+      if [[ "$mode" != "download" ]]; then
+        if install_apk "$APK_DIR/$a" "$a" "$mode"; then succ=$((succ+1)); else fail=$((fail+1)); fi
+      else succ=$((succ+1)); fi
+    else fail=$((fail+1)); fi
+    print_status_table
+  done
+  info "Done: success=${succ} failed=${fail}"
+  read -r -p "Press Enter..."
 }
 
-main_menu "$@"
+# ===== Menus (cleaned & reworded) =====
+main_menu(){
+  while true; do
+    clear_screen; print_banner
+    echo -e "${C_BOLD}${LINE}${C_RESET}"
+    echo -e "${C_BLUE}1.${C_RESET} Start: Download & install/update"
+    echo -e "${C_BLUE}2.${C_RESET} Utilities"
+    echo -e "${C_BLUE}3.${C_RESET} Exit vernix"
+    echo
+    read -r -p "Choose an option: " ch; ch="$(trim "$ch")"
+    case "$ch" in
+      1) option_start_auto ;;
+      2) option_utilities ;;
+      3) info "Bye"; exit 0 ;;
+      *) err "Invalid"; sleep 1 ;;
+    esac
+  done
+}
+
+option_utilities(){
+  while true; do
+    clear_screen; print_banner
+    echo -e "Utilities:\n"
+    echo -e "${C_BLUE}1.${C_RESET} Setup url(s) (add or view saved release links)"
+    echo -e "${C_BLUE}2.${C_RESET} Manage saved url(s) (delete)"
+    echo -e "${C_BLUE}3.${C_RESET} Manage downloaded apks (delete)"
+    echo
+    echo -e "$(back_label "Main Menu")"
+    read -r -p "Choose an option: " m; m="$(trim "$m")"
+    case "$m" in
+      1) option_setup_urls ;;
+      2) option_manage_urls ;;
+      3) option_manage_apks ;;
+      0) return 0 ;;
+      *) err "Invalid"; sleep 1 ;;
+    esac
+  done
+}
+
+option_setup_urls(){
+  while true; do
+    clear_screen; print_banner
+    echo -e "Setup url(s):\n"
+    echo -e "${C_BLUE}1.${C_RESET} Add a GitHub release url"
+    echo -e "${C_BLUE}2.${C_RESET} List saved url(s)"
+    echo
+    echo -e "$(back_label "Utilities")"
+    read -r -p "Choose an option: " s; s="$(trim "$s")"
+    case "$s" in
+      1) read -r -p "Enter GitHub release url to add: " url; url="$(trim "$url")"; save_url "$url"; read -r -p "Press Enter...";;
+      2) load_saved_urls
+         if [[ ${#SAVED_URLS[@]} -eq 0 ]]; then warn "No saved url(s)."; else
+           echo "Saved url(s):"; i=1; for u in "${SAVED_URLS[@]}"; do echo "  ${i}. $u"; i=$((i+1)); done
+         fi
+         read -r -p "Press Enter...";;
+      0) return 0;;
+      *) err "Invalid"; sleep 1;;
+    esac
+  done
+}
+
+option_manage_urls(){
+  while true; do
+    clear_screen; print_banner
+    load_saved_urls
+    echo -e "Manage saved url(s):\n"
+    # Always show current list at the top
+    if [[ ${#SAVED_URLS[@]} -eq 0 ]]; then
+      warn "No saved url(s)."
+    else
+      echo "Saved url(s):"
+      i=1; for u in "${SAVED_URLS[@]}"; do echo "  ${i}. ${u}"; i=$((i+1)); done
+    fi
+    echo
+    echo -e "${LINE}\n"
+    echo -e "${C_BLUE}1.${C_RESET} Delete all saved url(s)"
+    echo -e "${C_BLUE}2.${C_RESET} Delete by number(s)"
+    echo
+    echo -e "$(back_label "Utilities")"
+    read -r -p "Choose an option: " c; c="$(trim "$c")"
+    case "$c" in
+      1)
+        if confirm "Delete all saved url(s)?"; then
+          clear_all_urls
+        else
+          warn "Cancelled."
+        fi
+        read -r -p "Press Enter...";;
+      2)
+        if [[ ${#SAVED_URLS[@]} -eq 0 ]]; then
+          warn "No saved url(s)."
+          read -r -p "Press Enter..."
+        else
+          read -r -p "[Use commas/ranges, e.g., 1,2,4 or 2-5] Choose numbers: " nums; nums="$(trim "$nums")"
+          if parse_index_selection "$nums"; then
+            declare -A T; for idx in "${selected_indices[@]}"; do T[$idx]=1; done
+            j=1; REM=()
+            for u in "${SAVED_URLS[@]}"; do
+              if [[ -z "${T[$j]:-}" ]]; then
+                REM+=("$u")
+              else
+                deleting "url: $u"
+              fi
+              j=$((j+1))
+            done
+            printf "%s\n" "${REM[@]}" > "$SAVED_URLS_FILE" || true
+            load_saved_urls
+            success "Selected url(s) deleted."
+          else
+            warn "Invalid selection."
+          fi
+          read -r -p "Press Enter..."
+        fi
+        ;;
+      0) return 0;;
+      *) err "Invalid"; sleep 1;;
+    esac
+  done
+}
+
+list_apks(){ mapfile -t APK_LIST < <(ls -1 "$APK_DIR" 2>/dev/null | sed -n '1,999p') || APK_LIST=(); }
+
+clear_all_apks(){
+  mapfile -t _files < <(find "$APK_DIR" -type f -name '*.apk' -print 2>/dev/null || true)
+  if (( ${#_files[@]} == 0 )); then
+    warn "No apks present."
+    return 0
+  fi
+  for f in "${_files[@]}"; do deleting "$(basename "$f")"; rm -f "$f"; done
+  success "All apks deleted."
+  list_apks
+}
+
+option_manage_apks(){
+  while true; do
+    clear_screen; print_banner
+    echo -e "Manage downloaded apks:\n"
+    echo -e "${C_BLUE}1.${C_RESET} Delete all apks"
+    echo -e "${C_BLUE}2.${C_RESET} Delete apks by number(s)"
+    echo
+    echo -e "$(back_label "Utilities")"
+    read -r -p "Choose an option: " a; a="$(trim "$a")"
+    case "$a" in
+      1)
+        if confirm "Delete all downloaded apks?"; then
+          clear_all_apks
+        else
+          warn "Cancelled."
+        fi
+        read -r -p "Press Enter...";;
+      2)
+        list_apks
+        if [[ ${#APK_LIST[@]} -eq 0 ]]; then
+          warn "No apks present."
+          read -r -p "Press Enter..."
+        else
+          echo "apks:"
+          echo "[Use commas/ranges, e.g., 1,2,4 or 3-6]"
+          i=1; for f in "${APK_LIST[@]}"; do echo "  ${i}. $f"; i=$((i+1)); done
+          read -r -p "Choose numbers: " nums; nums="$(trim "$nums")"
+          if parse_index_selection "$nums"; then
+            declare -A T; for idx in "${selected_indices[@]}"; do T[$idx]=1; done
+            j=1; for f in "${APK_LIST[@]}"; do
+              if [[ -n "${T[$j]:-}" ]]; then deleting "$f"; rm -f "$APK_DIR/$f"; fi
+              j=$((j+1))
+            done
+            list_apks
+            success "Selected apks deleted."
+          else
+            warn "Invalid selection."
+          fi
+          read -r -p "Press Enter..."
+        fi
+        ;;
+      0) return 0;;
+      *) err "Invalid"; sleep 1;;
+    esac
+  done
+}
+
+# Start flow
+option_start_auto(){
+  while true; do
+    clear_screen; print_banner
+    echo -e "Start: Download & install/update\n"
+    echo -e "${C_BLUE}1.${C_RESET} Configure saved url(s) (select what to fetch)"
+    echo
+    echo -e "$(back_label "Main Menu")"
+    read -r -p "Choose an option: " s; s="$(trim "$s")"
+    case "$s" in
+      1) choose_saved_url "Start" ;;
+      0) return 0 ;;
+      *) err "Invalid"; sleep 1 ;;
+    esac
+  done
+}
+
+# choose_saved_url: populate global APK_FULL_URLS and dedupe assets
+choose_saved_url(){
+  local prev="$1"
+  load_saved_urls
+  while true; do
+    clear_screen; print_banner
+    echo -e "Configure saved url(s):\n"
+    echo -e "${C_BLUE}1.${C_RESET} Select multiple saved url(s)"
+    echo -e "${C_BLUE}2.${C_RESET} Select one saved url"
+    echo
+    echo -e "$(back_label "$prev")"
+    read -r -p "Choose an option: " c; c="$(trim "$c")"
+    case "$c" in
+      1)
+        if [[ ${#SAVED_URLS[@]} -eq 0 ]]; then warn "No saved url(s)."; read -r -p "Press Enter..."; else
+          echo "[Use commas/ranges to select, e.g., 1,2,4 or 2-5]"
+          i=1; for u in "${SAVED_URLS[@]}"; do echo "  ${i}. $u"; i=$((i+1)); done
+          read -r -p "Choose numbers: " nums; nums="$(trim "$nums")"
+          if parse_index_selection "$nums"; then
+            chosen_urls=(); for idx in "${selected_indices[@]}"; do chosen_urls+=("${SAVED_URLS[$((idx-1))]:-(test_url)}"); done
+            assets_all=()
+            APK_FULL_URLS=()   # reset global mapping
+            for u in "${chosen_urls[@]}"; do
+              if fetch_assets_for_release "$u"; then
+                for idx in "${!assets_names[@]}"; do
+                  n="${assets_names[$idx]}"; url="${assets_urls[$idx]:-}"
+                  [[ -z "${APK_FULL_URLS[$n]:-}" ]] && APK_FULL_URLS["$n"]="$url"
+                  assets_all+=("$n")
+                done
+              else warn "No assets for $u"; fi
+            done
+            if [[ ${#assets_all[@]} -eq 0 ]]; then warn "No assets discovered."; read -r -p "Press Enter..."; else
+              declare -A seen; assets_unique=()
+              for n in "${assets_all[@]}"; do [[ -z "${seen[$n]:-}" ]] && assets_unique+=("$n") && seen[$n]=1; done
+              action_mode_menu assets_unique "Configure saved url(s)"
+            fi
+          else warn "Invalid input."; read -r -p "Press Enter..."; fi
+        fi
+        ;;
+      2)
+        if [[ ${#SAVED_URLS[@]} -eq 0 ]]; then warn "No saved url(s)."; read -r -p "Press Enter..."; else
+          i=1; for u in "${SAVED_URLS[@]}"; do echo "  ${i}. $u"; i=$((i+1)); done
+          read -r -p "Choose number: " num; num="$(trim "$num")"
+          if [[ "$num" =~ ^[0-9]+$ ]] && (( num>=1 && num<=${#SAVED_URLS[@]} )); then
+            chosen_url="${SAVED_URLS[$((num-1))]}"
+            echo "Selected: $chosen_url"; read -r -p "Press Enter..."
+            if fetch_assets_for_release "$chosen_url"; then
+              APK_FULL_URLS=()
+              for idx in "${!assets_names[@]}"; do APK_FULL_URLS["${assets_names[$idx]}"]="${assets_urls[$idx]:-}"; done
+              assets_list=( "${assets_names[@]}" )
+              action_mode_menu assets_list "Configure saved url(s)"
+            else warn "Failed to retrieve assets."; read -r -p "Press Enter..."; fi
+          else warn "Invalid."; fi
+        fi
+        ;;
+      0) return 0 ;;
+      *) err "Invalid"; sleep 1 ;;
+    esac
+  done
+}
+
+action_mode_menu(){
+  local -n available_assets=$1
+  local prev_name="$2"
+  while true; do
+    clear_screen; print_banner
+    echo -e "Action mode:\n"
+    echo -e "${C_BLUE}1.${C_RESET} Download only"
+    echo -e "${C_BLUE}2.${C_RESET} Download + install/update"
+    echo -e "${C_BLUE}3.${C_RESET} Force reinstall, then download + install/update"
+    echo
+    echo -e "$(back_label "$prev_name")"
+    read -r -p "Choose an option: " am; am="$(trim "$am")"
+    case "$am" in
+      1) mode="download"; select_and_process_assets available_assets mode prev_name;;
+      2) mode="install_update"; select_and_process_assets available_assets mode prev_name;;
+      3) mode="force"; select_and_process_assets available_assets mode prev_name;;
+      0) return 0;;
+      *) err "Invalid"; sleep 1;;
+    esac
+  done
+}
+
+select_and_process_assets(){
+  local -n avail=$1; local mode="$2"; local prev="$3"
+  clear_screen; print_banner
+  echo "Available packages:"; echo
+  i=1; for a in "${avail[@]}"; do echo "  ${i}. $a"; i=$((i+1)); done
+  echo -e "\napk download options:\n"
+  echo -e "${C_BLUE}1.${C_RESET} Choose by number(s)"
+  echo -e "${C_BLUE}2.${C_RESET} Choose by name pattern(s)"
+  echo -e "${C_BLUE}3.${C_RESET} Choose ALL"
+  echo
+  echo -e "$(back_label "$prev")"
+  read -r -p "Choose an option: " p; p="$(trim "$p")"
+  case "$p" in
+    1) read -r -p "[Examples: 1,2,4 or 2-6] Enter number(s): " nums; nums="$(trim "$nums")"
+       if parse_index_selection "$nums"; then to_download=(); for idx in "${selected_indices[@]}"; do to_download+=("${avail[$((idx-1))]}"); done; else warn "Invalid."; read -r -p "Press Enter..."; return 0; fi;;
+    2) read -r -p "[Examples: executor.5.apk,executor] Enter pattern(s), comma-separated: " names
+       IFS=',' read -r -a parts <<< "$names"; to_download=()
+       for pr in "${parts[@]}"; do pr="$(trim "$pr")"; for a in "${avail[@]}"; do [[ "$a" == *"$pr"* ]] && to_download+=("$a"); done; done;;
+    3) to_download=( "${avail[@]}" );;
+    0) return 0;;
+    *) warn "Invalid."; read -r -p "Press Enter..."; return 0;;
+  esac
+  if ! confirm "Proceed with ${#to_download[@]} selection(s)?"; then
+    warn "Cancelled."
+    read -r -p "Press Enter..."
+    return 0
+  fi
+  for a in "${to_download[@]}"; do
+    [[ -z "${APK_FULL_URLS[$a]:-}" ]] && APK_FULL_URLS["$a"]="${BASE_URL%/}/$a"
+  done
+  run_selected_assets to_download "$mode"
+}
+
+# bootstrap
+load_saved_urls
+main_menu
